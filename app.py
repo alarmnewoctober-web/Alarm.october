@@ -780,6 +780,26 @@ _rating_locks: dict = {}
 _rating_locks_guard = threading.Lock()
 _rating_result_notified: set = set()  # alert_idهایی که نتیجه نهایی‌شون یک‌بار اعلام شده
 _rating_result_notified_lock = threading.Lock()
+RATE_REASON_TTL = 300  # ثانیه — مهلت نوشتن دلیل بعد از رای
+RATE_NOTIFY_WAIT = 120  # ثانیه — حداکثر صبر برای دلیلِ آخرین رأی‌دهنده قبل از ارسال نتیجه
+
+def _rate_pending_valid(cid) -> bool:
+    """آیا این کاربر هنوز یه پرامپت دلیلِ معتبر (منقضی‌نشده) داره؟ منقضی‌شده‌ها پاک می‌شن"""
+    pr = _pending_rate.get(cid)
+    if not isinstance(pr, dict):
+        return False
+    if time.time() - pr.get("ts", 0) > RATE_REASON_TTL:
+        _pending_rate.pop(cid, None)
+        return False
+    return True
+
+def _rate_has_open_reasons(alert_id: str) -> bool:
+    """فقط دلیلِ «آخرین رأی‌دهنده» (کسی که رأیش رأی‌گیری رو بسته) نتیجه رو عقب می‌ندازه، حداکثر RATE_NOTIFY_WAIT ثانیه؛
+    دلیل بقیه‌ی رأی‌دهنده‌ها منتظر نمی‌مونه."""
+    now = time.time()
+    return any(isinstance(v, dict) and v.get("alert_id") == alert_id and v.get("closer")
+               and now - v.get("ts", 0) <= RATE_NOTIFY_WAIT
+               for v in list(_pending_rate.values()))
 
 def _rating_lock_for(alert_id: str) -> threading.Lock:
     with _rating_locks_guard:
@@ -811,7 +831,7 @@ def _sb_save_rating(alert_id: str, voter_cid: str, voter_name: str, score: int,
                     reason: str, creator_name: str):
     if not SUPABASE_KEY:
         print("[rating] no SUPABASE_KEY")
-        return
+        return False
     try:
         payload = {
             "id": f"{alert_id}_{voter_cid}",
@@ -829,8 +849,10 @@ def _sb_save_rating(alert_id: str, voter_cid: str, voter_name: str, score: int,
             headers={**_sb_h(), "Prefer": "resolution=merge-duplicates,return=minimal"},
             json=payload, timeout=8)
         print(f"[rating] save status={r.status_code} body={r.text[:120]}")
+        return r.status_code in (200, 201, 204)
     except Exception as e:
         print(f"[rating] save exc: {e}")
+        return False
 
 def _compute_rating_state(votes: list, creator_name: str) -> dict:
     eligible = _eligible_raters(creator_name)
@@ -1033,6 +1055,45 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
             send_tg(token, RATING_RESULT_NOTIFY_CID, "📣 نتیجه امتیاز:\n\n" + text)
         except Exception as e:
             print(f"[rating] ali notify: {e}")
+
+def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
+    """نتیجه‌ی نهایی رو فقط وقتی بفرست که رأی‌گیری بسته شده و دیگه کسی در حال نوشتن دلیل نیست (فقط یک‌بار)"""
+    try:
+        if _rate_has_open_reasons(alert_id):
+            return
+        if not creator_name:
+            creator_name = _load_fired_msg_map(alert_id).get("__creator__", "")
+        state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name)
+        if not state["closed"]:
+            return
+        with _rating_result_notified_lock:
+            if alert_id in _rating_result_notified:
+                return
+            _rating_result_notified.add(alert_id)
+        _notify_rating_result(token, alert_id, state, creator_name)
+    except Exception as e:
+        print(f"[rating] try_notify exc: {e}")
+
+def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
+    """آلارم فوری با نظرسنجی — پیام با بخش امتیاز + دکمه‌های ۱ تا ۵ ارسال و map برای ادیت/رأی ذخیره می‌شه"""
+    st0 = _compute_rating_state([], creator)
+    full = msg + _build_rating_section(st0)
+    kb = _rating_keyboard(aid, st0)
+    cid_to_mid = {}
+    for tc in tgts:
+        mid = send_tg_keyboard(tok, str(tc), full, kb, track=False)
+        if mid:
+            cid_to_mid[str(tc)] = mid
+    if cid_to_mid:
+        cid_to_mid["__tag__"] = atag
+        cid_to_mid["__text__"] = msg
+        cid_to_mid["__creator__"] = creator
+        _fired_msg_ids[aid] = cid_to_mid
+        try:
+            _sb_save_fired_msgs(aid, cid_to_mid)
+        except Exception as e:
+            print(f"[instant] fired_msgs save exc: {e}")
+    return cid_to_mid
 
 # نام کسی که در حالت فعال «ترجیح داده نمی‌شه» — این خودش همیشه ثابت می‌مونه،
 # اما این‌که فعال باشه یا نه از پنل وب قابل تغییره (نگاه کن به _deprioritize_masoud_active)
@@ -2278,29 +2339,54 @@ def _do_update(upd, token):
                                         if st_chk["closed"]:
                                             answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                                         else:
-                                            answer_callback(token_cbq, cbq_id, "امتیاز %s ثبت شد" % rt_score)
-                                            _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, "", creator_rt)
-                                            _extra = (cbq_cid, cbq_msg_id)
-                                            _fb_text = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
-                                            print(f"[rating] before refresh map_keys={list((_fired_msg_ids.get(rt_aid) or {}).keys())} fb_len={len(_fb_text)}")
-                                            state_after = _refresh_rating_messages(
-                                                token_cbq, rt_aid, creator_rt,
-                                                extra_chat_msg=_extra, fallback_text=_fb_text)
-                                            _pending_rate[clicker_id_rt] = {
-                                                "alert_id": rt_aid, "score": rt_score,
-                                                "voter_name": voter_name_rt, "creator": creator_rt,
-                                                "already_saved": True,
-                                            }
-                                            _pending_rate[cbq_cid] = _pending_rate[clicker_id_rt]
-                                            send_tg(token_cbq, cbq_cid, "✅ امتیاز <b>%s/5</b> ثبت شد. دلیل اختیاری رو بفرست یا نادیده بگیر." % rt_score)
-                                            if state_after and state_after.get("closed"):
-                                                should_notify = False
-                                                with _rating_result_notified_lock:
-                                                    if rt_aid not in _rating_result_notified:
-                                                        _rating_result_notified.add(rt_aid)
-                                                        should_notify = True
-                                                if should_notify:
-                                                    threading.Thread(target=_notify_rating_result, args=(token_cbq, rt_aid, state_after, creator_rt), daemon=True).start()
+                                            if not _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, "", creator_rt):
+                                                answer_callback(token_cbq, cbq_id, "❌ ثبت نشد، دوباره بزن")
+                                            else:
+                                                answer_callback(token_cbq, cbq_id, "امتیاز %s ثبت شد" % rt_score)
+                                                _extra = (cbq_cid, cbq_msg_id)
+                                                _fb_text = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
+                                                print(f"[rating] before refresh map_keys={list((_fired_msg_ids.get(rt_aid) or {}).keys())} fb_len={len(_fb_text)}")
+                                                state_after = _refresh_rating_messages(
+                                                    token_cbq, rt_aid, creator_rt,
+                                                    extra_chat_msg=_extra, fallback_text=_fb_text)
+                                                # اگه این نفر هنوز پرامپت دلیلِ باز برای آلارم دیگه‌ای داشت، پاکش کن
+                                                _old_pr = _pending_rate.pop(clicker_id_rt, None)
+                                                if isinstance(_old_pr, dict):
+                                                    if _old_pr.get("prompt_mid"):
+                                                        _delete_msg_after(token_cbq, cbq_cid, _old_pr["prompt_mid"], delay=0)
+                                                    if _old_pr.get("alert_id"):
+                                                        threading.Thread(target=_rate_try_notify, args=(token_cbq, _old_pr["alert_id"], _old_pr.get("creator", "")), daemon=True).start()
+                                                # پرامپت دلیل (با دکمه رد کردن) — «ثبت شد» بعد از نوشتن دلیل میاد
+                                                _prompt_mid = send_tg_keyboard(
+                                                    token_cbq, cbq_cid,
+                                                    "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score,
+                                                    [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % rt_aid}]])
+                                                _pending_rate[clicker_id_rt] = {
+                                                    "alert_id": rt_aid, "score": rt_score,
+                                                    "voter_name": voter_name_rt, "creator": creator_rt,
+                                                    "already_saved": True,
+                                                    "ts": time.time(), "prompt_mid": _prompt_mid,
+                                                    "closer": bool(state_after and state_after.get("closed")),
+                                                }
+                                                _pending_rate[cbq_cid] = _pending_rate[clicker_id_rt]
+                                                # نتیجه‌ی نهایی بعد از دلیل (یا رد کردنِ) آخرین رأی‌دهنده میاد؛ تایمر برای وقتیه که اون هم کاری نکنه
+                                                if state_after and state_after.get("closed"):
+                                                    _tm_rt = threading.Timer(RATE_NOTIFY_WAIT + 3, _rate_try_notify, args=(token_cbq, rt_aid, creator_rt))
+                                                    _tm_rt.daemon = True
+                                                    _tm_rt.start()
+
+                    elif cbq_data.startswith("rate_skip:"):
+                        rs_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
+                        answer_callback(token_cbq, cbq_id)
+                        rs_creator = ""
+                        _rs_pr = _pending_rate.get(cbq_cid)
+                        if isinstance(_rs_pr, dict) and _rs_pr.get("alert_id") == rs_aid:
+                            rs_creator = _rs_pr.get("creator", "")
+                            _pending_rate.pop(cbq_cid, None)
+                        if cbq_msg_id:
+                            _delete_msg_after(token_cbq, cbq_cid, cbq_msg_id, delay=0)
+                        if rs_aid:
+                            threading.Thread(target=_rate_try_notify, args=(token_cbq, rs_aid, rs_creator), daemon=True).start()
 
                     elif cbq_data.startswith("del_confirm:"):
                         # مرحله اول: نمایش تأیید حذف
@@ -3827,17 +3913,8 @@ def _do_update(upd, token):
                         sos_aid = str(int(time.time() * 1000))
                         def _bg_sos(tok=token_cbq, tgts=targets_sc, msg=out_sc, s=sym_sc, aid=sos_aid,
                                     atag=alarm_num_tag_sc, sndr=sender_sc, cond=condition_sc, atp=atype_sc, cur=cur_sc):
-                            sos_cid_to_mid = {}
                             if s.upper() not in TEMP_MUTED_SYMBOLS and not _is_instant_sender_muted(sndr):
-                                for tc_sc in tgts:
-                                    mid_sc = send_tg_keyboard(tok, str(tc_sc), msg, [], track=False)
-                                    if mid_sc:
-                                        sos_cid_to_mid[str(tc_sc)] = mid_sc
-                            if sos_cid_to_mid:
-                                sos_cid_to_mid["__tag__"] = atag
-                                sos_cid_to_mid["__text__"] = msg
-                                _fired_msg_ids[aid] = sos_cid_to_mid
-                                threading.Thread(target=_sb_save_fired_msgs, args=(aid, sos_cid_to_mid), daemon=True).start()
+                                _send_instant_rated(tok, tgts, msg, aid, atag, sndr)
                             # ذخیره توی archive
                             sos_arch_entry = {"id": aid, "symbol": s, "type": atp,
                                 "condition": cond, "comment": "", "created_by": sndr,
@@ -4457,7 +4534,7 @@ def _do_update(upd, token):
                             [[{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}]])
                     threading.Thread(target=_do_bulk_false_txt, daemon=True).start()
 
-                elif cid in _pending_rate and not txt.startswith("/"):
+                elif _rate_pending_valid(cid) and not txt.startswith("/"):
                     pr = _pending_rate.pop(cid, None)
                     if pr:
                         for k in list(_pending_rate.keys()):
@@ -4469,9 +4546,15 @@ def _do_update(upd, token):
                         voter_name_rt = pr["voter_name"]
                         creator_rt = pr.get("creator", "")
                         reason_rt = "" if txt.strip() in ("-", "—", "بدون دلیل", ".") else txt.strip()[:300]
-                        _sb_save_rating(rt_aid, cid, voter_name_rt, rt_score, reason_rt, creator_rt)
-                        _refresh_rating_messages(token, rt_aid, creator_rt)
-                        send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
+                        if _sb_save_rating(rt_aid, cid, voter_name_rt, rt_score, reason_rt, creator_rt):
+                            _refresh_rating_messages(token, rt_aid, creator_rt)
+                            if pr.get("prompt_mid"):
+                                _delete_msg_after(token, cid, pr["prompt_mid"], delay=0)
+                            send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
+                            threading.Thread(target=_rate_try_notify, args=(token, rt_aid, creator_rt), daemon=True).start()
+                        else:
+                            _pending_rate[cid] = pr  # دوباره فرصت بده
+                            send_tg(token, cid, "❌ دلیل ثبت نشد، دوباره بفرست یا «رد کردن» رو بزن")
 
                 elif cid in _pending_alarm and not txt.startswith("/"):
                     step = _pending_alarm[cid]["step"]
@@ -4656,13 +4739,13 @@ def _do_update(upd, token):
                                 f"💰 <b>{sym_s}</b>  {dir_lbl_s}\n"
                                 + (f"💬 {comment_s}\n" if comment_s else "")
                                 + f"⏰ {now_pretty()} (تهران)", [])
-                        # broadcast به بقیه
+                        # broadcast به بقیه (با نظرسنجی)
+                        sos_aid_s = str(int(time.time() * 1000))
                         if sym_s.upper() not in TEMP_MUTED_SYMBOLS and not _is_instant_sender_muted(sender_s):
-                            for tc2 in targets2:
-                                send_tg_keyboard(token, str(tc2), out_s, [], track=False)
+                            _send_instant_rated(token, targets2, out_s, sos_aid_s, alarm_num_tag_s, sender_s)
 
                         # ذخیره توی آرشیو (این مسیر قبلاً اصلاً ذخیره نمی‌شد)
-                        sos_arch_entry_s = {"id": str(int(time.time()*1000)), "symbol": sym_s, "type": atype_s,
+                        sos_arch_entry_s = {"id": sos_aid_s, "symbol": sym_s, "type": atype_s,
                             "condition": condition_s, "comment": comment_s, "created_by": sender_s,
                             "active": False, "fired_at": now_teh(), "fired_price": cur_s,
                             "instant": True, "created_at": now_teh(), "tag": alarm_num_tag_s}
@@ -4788,17 +4871,8 @@ def _do_update(upd, token):
                         _, all_cids, _ = _get_token_and_cids()
                         targets = all_cids if BROADCAST_MODE else [YOUR_CHAT_ID]
                         sos_aid_txt = f"sos_{sym}_{int(time.time())}"
-                        sos_cid_to_mid_txt = {}
                         if sym.upper() not in TEMP_MUTED_SYMBOLS and not _is_instant_sender_muted(sender_name):
-                            for tc in targets:
-                                mid_sos_txt = send_tg_keyboard(token, tc, out_msg, [], track=False)
-                                if mid_sos_txt:
-                                    sos_cid_to_mid_txt[str(tc)] = mid_sos_txt
-                        if sos_cid_to_mid_txt:
-                            sos_cid_to_mid_txt["__tag__"] = alarm_num_tag
-                            sos_cid_to_mid_txt["__text__"] = out_msg
-                            _fired_msg_ids[sos_aid_txt] = sos_cid_to_mid_txt
-                            threading.Thread(target=_sb_save_fired_msgs, args=(sos_aid_txt, sos_cid_to_mid_txt), daemon=True).start()
+                            _send_instant_rated(token, targets, out_msg, sos_aid_txt, alarm_num_tag, sender_name)
                         d = load_alerts()
                         arch = d.get("archive", [])
                         new_sos_entry = {"id": str(int(time.time()*1000)), "symbol": sym, "type": atype,
