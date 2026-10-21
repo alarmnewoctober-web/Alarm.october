@@ -1025,7 +1025,8 @@ function setDir(val) {
   document.getElementById('dir-sell').classList.toggle('active', val === 'above');
 }
 
-async function addAlert() {
+async function addAlert(opts) {
+  opts = opts || {};
   const symbol = document.getElementById('sym').value.trim().toUpperCase();
   const type = document.getElementById('mkt').value;
   const target_price = parseFloat(document.getElementById('tprice').value);
@@ -1039,22 +1040,98 @@ async function addAlert() {
   if (!target_price || target_price <= 0) { toast('قیمت هدف را وارد کنید'); return; }
   const btn = document.getElementById('add-btn');
   btn.textContent = '⏳'; btn.disabled = true;
-  const r = await fetch(`${API}/api/alerts`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({symbol, type, target_price, condition, comment, creator, pin, is_private, expire_days})
-  });
-  const d = await r.json();
-  btn.textContent = '+ افزودن'; btn.disabled = false;
-  if (d.ok) {
-    toast(`✅ آلارم ${symbol}${is_private ? ' (شخصی)' : ''} توسط ${creator} ثبت شد`);
-    document.getElementById('sym').value = '';
-    document.getElementById('tprice').value = '';
-    document.getElementById('acmt').value = '';
-    document.getElementById('aexp').value = '';
-    document.getElementById('private-chk').checked = false;
-    await loadAlerts();
-  } else toast(`❌ ${d.error || 'خطا در ثبت آلارم'}`);
+  const payload = {symbol, type, target_price, condition, comment, creator, pin, is_private, expire_days};
+  if (opts.force_new) payload.force_new = true;
+  if (opts.support_alert_id) payload.support_alert_id = opts.support_alert_id;
+  try {
+    const r = await fetch(`${API}/api/alerts`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    btn.textContent = '+ افزودن'; btn.disabled = false;
+    if (d.ok) {
+      if (d.supported) {
+        toast(d.message || '⭐ تأیید ناحیه ثبت شد');
+      } else {
+        toast(`✅ آلارم ${symbol}${is_private ? ' (شخصی)' : ''} توسط ${creator} ثبت شد`);
+        document.getElementById('sym').value = '';
+        document.getElementById('tprice').value = '';
+        document.getElementById('acmt').value = '';
+        document.getElementById('aexp').value = '';
+        document.getElementById('private-chk').checked = false;
+      }
+      closeNearbyModal();
+      await loadAlerts();
+      return;
+    }
+    if (d.needs_confirm && d.nearby && d.nearby.length) {
+      showNearbyModal(d.nearby, d.threshold_pips || 30);
+      return;
+    }
+    toast(`❌ ${d.error || d.message || 'خطا در ثبت آلارم'}`);
+  } catch (e) {
+    btn.textContent = '+ افزودن'; btn.disabled = false;
+    toast('❌ خطا در ارتباط با سرور');
+  }
+}
+
+function showNearbyModal(nearby, thr) {
+  let box = document.getElementById('nearby-modal');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'nearby-modal';
+    box.innerHTML = `
+      <div class="nearby-backdrop" onclick="closeNearbyModal()"></div>
+      <div class="nearby-panel">
+        <h3>⚠️ ناحیه نزدیک پیدا شد</h3>
+        <p class="nearby-sub">در فاصله ≤ <span id="nearby-thr"></span> پیپ، آلارم تیمی دیگری هست.</p>
+        <div id="nearby-list"></div>
+        <div class="nearby-actions">
+          <button type="button" class="btn btn-green" id="nearby-force-btn">➕ ثبت جدید مال خودم</button>
+          <button type="button" class="btn" onclick="closeNearbyModal()">انصراف</button>
+        </div>
+      </div>`;
+    document.body.appendChild(box);
+    if (!document.getElementById('nearby-style')) {
+      const st = document.createElement('style');
+      st.id = 'nearby-style';
+      st.textContent = `
+        #nearby-modal{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:16px}
+        #nearby-modal .nearby-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+        #nearby-modal .nearby-panel{position:relative;background:var(--bg2);border:1px solid var(--border2);border-radius:16px;padding:18px;max-width:420px;width:100%;max-height:80vh;overflow:auto}
+        #nearby-modal h3{font-size:15px;margin-bottom:6px}
+        #nearby-modal .nearby-sub{font-size:12px;color:var(--text2);margin-bottom:12px}
+        .nearby-item{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:8px}
+        .nearby-item .ni-title{font-family:var(--mono);font-weight:700;font-size:13px}
+        .nearby-item .ni-meta{font-size:11px;color:var(--text2);margin-top:4px;font-family:var(--mono)}
+        .nearby-item button{margin-top:8px;width:100%}
+        .nearby-actions{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+      `;
+      document.head.appendChild(st);
+    }
+  }
+  document.getElementById('nearby-thr').textContent = thr;
+  const list = document.getElementById('nearby-list');
+  list.innerHTML = nearby.map(n => {
+    const sup = (n.supporters||[]).map(s => (typeof s==='string'?s:(s.name||''))).filter(Boolean);
+    const supTxt = sup.length ? ` · ⭐ ${sup.join('، ')}` : '';
+    return `<div class="nearby-item">
+      <div class="ni-title">${n.created_by} — ${n.symbol} @ ${n.target_price}</div>
+      <div class="ni-meta">${n.direction} · ${n.distance_pips} پیپ فاصله${supTxt}</div>
+      <button type="button" class="btn btn-blue" onclick="agreeNearby('${n.id}')">⭐ موافقم — ستاره به این ناحیه</button>
+    </div>`;
+  }).join('');
+  document.getElementById('nearby-force-btn').onclick = () => addAlert({force_new: true});
+  box.style.display = 'flex';
+}
+function closeNearbyModal() {
+  const box = document.getElementById('nearby-modal');
+  if (box) box.style.display = 'none';
+}
+async function agreeNearby(alertId) {
+  await addAlert({support_alert_id: alertId});
 }
 
 async function sendInstant() {
