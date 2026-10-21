@@ -854,6 +854,30 @@ def _sb_save_rating(alert_id: str, voter_cid: str, voter_name: str, score: int,
         print(f"[rating] save exc: {e}")
         return False
 
+def _resolve_creator_name(name: str, cid=None) -> str:
+    """اسم سازنده‌ی آلارم (custom_name / یوزرنیم / آیدی) رو به اسم عضو تیم تو TEAM_MEMBERS تبدیل کن،
+    تا سازنده از رأی‌گیری آلارم خودش کنار گذاشته بشه."""
+    n = (name or "").strip()
+    if cid and TEAM_ID_TO_NAME.get(str(cid)):
+        return TEAM_ID_TO_NAME[str(cid)]
+    if n in TEAM_MEMBERS:
+        return n
+    if n in TEAM_ID_TO_NAME:
+        return TEAM_ID_TO_NAME[n]
+    m = next((t for t in TEAM_MEMBERS if _norm_name(t) == _norm_name(n)), None)
+    if m:
+        return m
+    try:
+        for usr in load_alerts().get("users", []):
+            cn_u = (usr.get("custom_name") or "").strip()
+            if cn_u and _norm_name(cn_u) == _norm_name(n):
+                tn = TEAM_ID_TO_NAME.get(str(usr.get("chat_id", "")))
+                if tn:
+                    return tn
+    except Exception as e:
+        print(f"[rating] resolve creator exc: {e}")
+    return n
+
 def _compute_rating_state(votes: list, creator_name: str) -> dict:
     eligible = _eligible_raters(creator_name)
     max_voters = max(1, len(eligible))
@@ -971,6 +995,8 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     state = _compute_rating_state(votes, creator_name)
     print(f"[rating] refresh start aid={alert_id} votes={state['voters_count']} total={state['total']}")
     msg_map = _load_fired_msg_map(alert_id)
+    if msg_map.get("__rating_cancelled__") == "1":
+        return state  # آلارم false شده — پیام نباید دوباره به حالت رأی‌گیری برگرده
     if extra_chat_msg:
         ec, em = extra_chat_msg
         if ec and em:
@@ -1056,13 +1082,57 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
         except Exception as e:
             print(f"[rating] ali notify: {e}")
 
+def _rate_cancel_poll(alert_id: str):
+    """آلارم false شد → رأی‌گیری بسته و کلاً لغو می‌شه: دکمه‌ها برداشته، نتیجه برای کسی نمی‌ره، پرامپت دلیل‌ها پاک."""
+    try:
+        with _rating_lock_for(alert_id):
+            msg_map = _load_fired_msg_map(alert_id)
+            _txt0 = msg_map.get("__text__", "") or ""
+            if not msg_map.get("__text_rated__") and ("__creator__" not in msg_map or "آلارم شخصی" in _txt0):
+                return  # این آلارم نظرسنجی نداشته (قدیمی یا شخصی)
+            if msg_map.get("__rating_cancelled__") == "1":
+                return
+            msg_map["__rating_closed__"] = "1"
+            msg_map["__rating_cancelled__"] = "1"
+            _fired_msg_ids[alert_id] = msg_map
+            try:
+                _sb_save_fired_msgs(alert_id, msg_map)
+            except Exception as e:
+                print(f"[rating] cancel save map exc: {e}")
+        # پرامپت‌های دلیلِ باز این آلارم
+        token = _get_token_and_cids()[0]
+        for k, v in list(_pending_rate.items()):
+            if isinstance(v, dict) and v.get("alert_id") == alert_id:
+                _pending_rate.pop(k, None)
+                if v.get("prompt_mid"):
+                    _delete_msg_after(token, str(k), v["prompt_mid"], delay=0)
+        base = _strip_rating_section(msg_map.get("__text__", "") or msg_map.get("__text_rated__", ""))
+        if not base:
+            return
+        new_text = base + "\n\n────────────\n⭐ <b>نظرسنجی</b>: ❌ لغو شد (آلارم false شد)"
+        for tc, tm in list(msg_map.items()):
+            if str(tc).startswith("__"):
+                continue
+            try:
+                payload = {"chat_id": str(tc), "message_id": int(tm), "text": new_text,
+                           "parse_mode": "HTML", "reply_markup": {"inline_keyboard": []}}
+                r = requests.post(f"https://api.telegram.org/bot{token}/editMessageText",
+                                  json=payload, timeout=10, headers=H)
+                print(f"[rating] cancel edit chat={tc} -> {r.status_code}")
+            except Exception as e:
+                print(f"[rating] cancel edit exc {tc}: {e}")
+    except Exception as e:
+        print(f"[rating] cancel exc: {e}")
+
 def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
     """نتیجه‌ی نهایی رو فقط وقتی بفرست که رأی‌گیری بسته شده و دیگه کسی در حال نوشتن دلیل نیست (فقط یک‌بار)"""
     try:
         if _rate_has_open_reasons(alert_id):
             return
-        if not creator_name:
-            creator_name = _load_fired_msg_map(alert_id).get("__creator__", "")
+        _mm = _load_fired_msg_map(alert_id)
+        if _mm.get("__rating_cancelled__") == "1":
+            return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
+        creator_name = _resolve_creator_name(creator_name or _mm.get("__creator__", ""))
         state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name)
         if not state["closed"]:
             return
@@ -1076,6 +1146,7 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
 
 def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
     """آلارم فوری با نظرسنجی — پیام با بخش امتیاز + دکمه‌های ۱ تا ۵ ارسال و map برای ادیت/رأی ذخیره می‌شه"""
+    creator = _resolve_creator_name(creator)
     st0 = _compute_rating_state([], creator)
     full = msg + _build_rating_section(st0)
     kb = _rating_keyboard(aid, st0)
@@ -1301,6 +1372,7 @@ def _sb_false_assignment(alarm_id: str, false_by: str, reason: str = ""):
     وقتی /False زده میشه — assignment رو غیرفعال کن.
     اگه قبلاً false شده بود، یه ردیف history جدید append کن (به جای overwrite).
     """
+    threading.Thread(target=_rate_cancel_poll, args=(alarm_id,), daemon=True).start()  # false → رأی‌گیری لغو
     if not SUPABASE_KEY: return
     try:
         # خوندن وضعیت فعلی برای گرفتن history قبلی
@@ -2326,7 +2398,10 @@ def _do_update(upd, token):
                                             creator_rt = r_cr.json()[0].get("created_by") or ""
                                     except Exception:
                                         pass
-                                if voter_name_rt in TEAM_MEMBERS and _norm_name(voter_name_rt) == _norm_name(creator_rt):
+                                creator_rt = _resolve_creator_name(creator_rt)
+                                if msg_map_rt.get("__rating_cancelled__") == "1":
+                                    answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
+                                elif voter_name_rt in TEAM_MEMBERS and _norm_name(voter_name_rt) == _norm_name(creator_rt):
                                     answer_callback(token_cbq, cbq_id, "سازنده نمی‌تونه رای بده")
                                 elif msg_map_rt.get("__rating_closed__") == "1":
                                     answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
@@ -5301,7 +5376,7 @@ def check_alerts():
                         )
                         assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
                         _is_team_alert = not a.get("is_private")
-                        _rate_state0 = _compute_rating_state([], creator) if _is_team_alert else None
+                        _rate_state0 = _compute_rating_state([], _resolve_creator_name(creator)) if _is_team_alert else None
                         def _fired_kb(cid):
                             rows_kb = []
                             if assignee_ack_id and str(cid) == str(assignee_ack_id):
@@ -5326,7 +5401,7 @@ def check_alerts():
                         if fired_cid_to_mid:
                             fired_cid_to_mid["__tag__"] = alarm_num_tag
                             fired_cid_to_mid["__text__"] = fired_msg
-                            fired_cid_to_mid["__creator__"] = creator
+                            fired_cid_to_mid["__creator__"] = _resolve_creator_name(creator)
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             print(f"[fire] saved msg map for {a['id']}: chats={list(fired_cid_to_mid.keys())}")
                             # همگام — تا قبل از اولین رای، map تو Supabase باشه (multi-instance)
