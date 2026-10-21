@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from flask import Flask, request, jsonify, send_from_directory
 from datetime import datetime, timedelta
 import re
+import html as _hesc
 
 app = Flask(__name__, static_folder='static')
 VERSION = "8.0"
@@ -177,6 +178,8 @@ def _sb_upsert_alert(a):
             payload["expired_at"] = a["expired_at"]
         if a.get("supporters") is not None:
             payload["supporters"] = a.get("supporters") or []
+        if a.get("nearby_refs"):
+            payload["nearby_refs"] = a.get("nearby_refs")
 
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/alerts",
@@ -184,11 +187,13 @@ def _sb_upsert_alert(a):
             json=payload, timeout=10)
         if r.status_code not in (200,201,204):
             err_text = r.text
-            # اگه ستون پیدا نشد، بدون اون فیلد دوباره تلاش کن
+            # اگه ستون پیدا نشد، بدون اون فیلد دوباره تلاش کن (تا ۳ بار — چون الان دو ستون اختیاری داریم)
             if r.status_code == 400 and "PGRST204" in err_text:
                 import re as _re
-                missing = _re.search(r"Could not find the '([^']+)'", err_text)
-                if missing:
+                for _try in range(3):
+                    missing = _re.search(r"Could not find the '([^']+)'", err_text)
+                    if not missing:
+                        break
                     col = missing.group(1)
                     print(f"[alerts] ستون '{col}' توی DB نیست — بدون اون retry میکنیم")
                     payload.pop(col, None)
@@ -196,9 +201,13 @@ def _sb_upsert_alert(a):
                         f"{SUPABASE_URL}/rest/v1/alerts",
                         headers={**_sb_h(), "Prefer": "resolution=merge-duplicates,return=minimal"},
                         json=payload, timeout=10)
-                    if r2.status_code not in (200,201,204):
-                        print(f"[alerts] upsert {a['id']} retry failed: {r2.status_code} {r2.text[:120]}")
-                    return
+                    if r2.status_code in (200,201,204):
+                        return
+                    err_text = r2.text
+                    if not (r2.status_code == 400 and "PGRST204" in err_text):
+                        break
+                print(f"[alerts] upsert {a['id']} retry failed: {err_text[:120]}")
+                return
             print(f"[alerts] upsert {a['id']}: {r.status_code} {r.text[:120]}")
     except Exception as e:
         print(f"[alerts] upsert error: {e}")
@@ -422,6 +431,7 @@ def _sb_load_all_alerts():
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
                 "supporters":   row.get("supporters") or [],
+                "nearby_refs":  row.get("nearby_refs") or [],
             }
             status = row.get("status","active")
             if status == "fired" or row.get("fired_at"):
@@ -5243,9 +5253,16 @@ def _sb_load_active_only():
     """
     if not SUPABASE_KEY: return None
     try:
+        _base_cols = "id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users"
         r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select=id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users&limit=500",
+            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_base_cols},supporters,nearby_refs&limit=500",
             headers=_sb_h(), timeout=10)
+        if r.status_code == 400 and ("supporters" in r.text or "nearby_refs" in r.text):
+            # ستون‌ها هنوز تو DB ساخته نشدن — بدون اون‌ها بخون (ولی ستاره/نزدیکی از دست می‌ره)
+            print("[alerts] ⚠️ ستون supporters/nearby_refs تو جدول alerts نیست — SQL مایگریشن رو اجرا کن")
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_base_cols}&limit=500",
+                headers=_sb_h(), timeout=10)
         if r.status_code != 200:
             print(f"[alerts] load active-only failed: {r.status_code} {r.text[:80]}")
             return None
@@ -5284,6 +5301,8 @@ def _sb_load_active_only():
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
                 "expires_at":   row.get("expires_at"),
+                "supporters":   row.get("supporters") or [],
+                "nearby_refs":  row.get("nearby_refs") or [],
             })
         data = {"alerts": alerts, "archive": [], "telegram": tg,
                 "users": users, "errors": [], "last_update": now_teh()}
@@ -5456,7 +5475,23 @@ def check_alerts():
                                 _sup_names.append(_su.strip())
                         supporters_line = ""
                         if _sup_names:
-                            supporters_line = "\n⭐ تأیید ناحیه توسط: <b>" + "، ".join(_sup_names) + "</b>"
+                            supporters_line = "\n⭐ تأیید ناحیه توسط: <b>" + "، ".join(_hesc.escape(n, quote=False) for n in _sup_names) + "</b>"
+                        # 📍 اگه موقع ثبت، ناحیه‌ی نزدیک دیگه‌ای هم بود (و کاربر «ثبت جدید» زد)، اینجا نشون بده
+                        nearby_line = ""
+                        _nparts = []
+                        for _nr in (a.get("nearby_refs") or [])[:3]:
+                            if not (isinstance(_nr, dict) and _nr.get("by")):
+                                continue
+                            try:
+                                _nr_price = fmt_price(float(_nr.get("price", 0)), sym)
+                            except Exception:
+                                _nr_price = str(_nr.get("price", ""))
+                            _nparts.append(
+                                f"<b>{_hesc.escape(str(_nr['by']), quote=False)}</b> "
+                                f"(<code>{_nr_price}</code> — {_nr.get('distance_pips', '?')} پیپ {_nr.get('direction', '')})"
+                            )
+                        if _nparts:
+                            nearby_line = "\n📍 ناحیه‌ی نزدیک هم ثبت شده برای: " + "، ".join(_nparts)
                         fired_msg = (
                             f"🚨 <b>آلارم قیمت!</b>\n\n"
                             f"💰 <b>#{sym}</b> — {arrow}\n"
@@ -5468,6 +5503,7 @@ def check_alerts():
                             f"{cmt}"
                             f"{private_label}"
                             f"{supporters_line}"
+                            f"{nearby_line}"
                             f"{assignee_line}\n\n⏰ {now_pretty()} (تهران){created_label}"
                         )
                         assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
@@ -5669,6 +5705,18 @@ def add_alert():
                 "message": "نزدیک این قیمت، آلارم تیمی دیگری هست. جدید ثبت کنید یا همان ناحیه را تأیید (ستاره) کنید."
             }), 409
 
+    # کاربر با وجود ناحیه‌ی نزدیک «ثبت جدید» زده — snapshot رو تو خود آلارم نگه می‌داریم تا موقع فایر نشون داده بشه
+    nearby_refs = []
+    if not is_private and force_new and tgt > 0:
+        for n in _find_nearby_team_alerts(sym, tgt, condition, exclude_name=creator)[:3]:
+            nearby_refs.append({
+                "id": n.get("id"),
+                "by": n.get("created_by"),
+                "price": n.get("target_price"),
+                "distance_pips": n.get("distance_pips"),
+                "direction": n.get("direction"),
+            })
+
     cur = get_price(sym, atype) if (atype!="forex" or is_forex_market_open()) else None
     expire_days = body.get("expire_days")
     expires_at = None
@@ -5688,6 +5736,7 @@ def add_alert():
         "notify_only": private_cid,
         "expires_at": expires_at,
         "supporters": [],
+        "nearby_refs": nearby_refs,
         "last_price": cur, "last_checked": now_teh() if cur else None,
         "created_at": now_teh()
     }
