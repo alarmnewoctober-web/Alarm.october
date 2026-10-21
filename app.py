@@ -1032,6 +1032,19 @@ def _build_rating_section(state: dict) -> str:
         lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
     return "\n".join(lines)
 
+def _build_rating_section_cancelled(state: dict) -> str:
+    """نظرسنجی بعد از false شدن آلارم: رأی‌ها و دلیل‌های ثبت‌شده تا همون لحظه می‌مونن، فقط وضعیت «لغو شد» می‌شه"""
+    lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>  —  ❌ <b>لغو شد (آلارم false شد)</b>"]
+    if state.get("votes"):
+        lines.append(f"رأی‌های ثبت‌شده تا قبل از لغو: {state['voters_count']}/{state['max_voters']}  ·  مجموع: <b>{state['total']}</b>")
+        lines.append("")
+        for v in state["votes"]:
+            why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
+            sc = v.get("score", "?")
+            nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
+            lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
+    return "\n".join(lines)
+
 def _rating_keyboard(alert_id: str, state: dict) -> list:
     if state.get("closed"):
         return []
@@ -1204,7 +1217,14 @@ def _rate_cancel_poll(alert_id: str):
         base = _strip_rating_section(msg_map.get("__text__", "") or msg_map.get("__text_rated__", ""))
         if not base:
             return
-        new_text = base + "\n\n────────────\n⭐ <b>نظرسنجی</b>: ❌ لغو شد (آلارم false شد)"
+        # رأی‌ها و دلیل‌های ثبت‌شده تا قبل از false رو از DB می‌خونیم و تو پیام نگه می‌داریم
+        try:
+            _cn = _resolve_creator_name(msg_map.get("__creator__", ""))
+            _st_c = _compute_rating_state(_sb_load_ratings(alert_id), _cn)
+        except Exception as e:
+            print(f"[rating] cancel load votes exc: {e}")
+            _st_c = {"votes": []}
+        new_text = base + _build_rating_section_cancelled(_st_c)
         for tc, tm in list(msg_map.items()):
             if str(tc).startswith("__"):
                 continue
