@@ -897,7 +897,7 @@ def _compute_rating_state(votes: list, creator_name: str) -> dict:
     n = len(clean)
     remaining = max(0, max_voters - n)
     max_possible = total + remaining * 5
-    min_possible = total + remaining * 1
+    min_possible = total + remaining * 0  # رای ۰ هم مجاز است
     label, closed = "pending", False
     if remaining == 0:
         closed = True
@@ -931,18 +931,27 @@ def _build_rating_section(state: dict) -> str:
             why = (v.get("reason") or "").strip()
             sc = v.get("score", "?")
             nm = v.get("voter_name", "—")
-            lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
+            try:
+                sc_i = int(sc)
+            except Exception:
+                sc_i = -1
+            if sc_i == 0:
+                sc_txt = "❌ مخالف"
+            else:
+                sc_txt = f"{sc}/5"
+            lines.append(f"• <b>{nm}</b>: {sc_txt}" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"]:
         lines.append("")
-        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
+        lines.append("<i>❌ مخالف · یا امتیاز ۱ تا ۵</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
     if state.get("closed"):
         return []
     aid = str(alert_id)
-    # تلگرام رنگ واقعی دکمه نداره — با ایموجی طیف قرمز→سبز
+    # ۰ = مخالف کامل (بدون امتیاز) — بعد طیف قرمز→سبز
     return [[
+        {"text": "❌ 0", "callback_data": f"rate:{aid}:0"},
         {"text": "🔴 1", "callback_data": f"rate:{aid}:1"},
         {"text": "🟠 2", "callback_data": f"rate:{aid}:2"},
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
@@ -2375,7 +2384,7 @@ def _do_update(upd, token):
                         except ValueError:
                             rt_score = 0
                         print(f"[rating] click aid={rt_aid} score={rt_score} cid={cbq_cid}")
-                        if not rt_aid or rt_score not in (1, 2, 3, 4, 5):
+                        if not rt_aid or rt_score not in (0, 1, 2, 3, 4, 5):
                             answer_callback(token_cbq, cbq_id, "امتیاز نامعتبر")
                         else:
                             clicker_id_rt = str(cbq.get("from", {}).get("id", ""))
