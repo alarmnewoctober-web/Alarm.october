@@ -877,6 +877,21 @@ _rating_result_notified: set = set()  # alert_idهایی که نتیجه نها�
 _rating_result_notified_lock = threading.Lock()
 RATE_REASON_TTL = 300  # ثانیه — مهلت نوشتن دلیل بعد از رای
 RATE_NOTIFY_WAIT = 120  # ثانیه — حداکثر صبر برای دلیلِ آخرین رأی‌دهنده قبل از ارسال نتیجه
+RATING_TIMEOUT_NORMAL = 3600  # ثانیه — مهلت رأی‌گیری آلارم معمولی فارکس/کریپتو (۱ ساعت)
+RATING_TIMEOUT_FAST = 900     # ثانیه — مهلت رأی‌گیری آلارم فوری/SOS و هر آلارم طلا (۱۵ دقیقه)
+RATING_TIMEOUT_CHECK_EVERY = 30  # ثانیه — هر چند ثانیه یه بار مهلت‌ها (فقط از حافظه) چک می‌شن
+
+def _rating_timeout_seconds(symbol: str = "", instant: bool = False) -> int:
+    """آلارم فوری/SOS و طلا (معمولی یا فوری) ۱۵ دقیقه؛ بقیه‌ی فارکس و کریپتو ۱ ساعت"""
+    if instant or "XAU" in (symbol or "").upper() or "GOLD" in (symbol or "").upper():
+        return RATING_TIMEOUT_FAST
+    return RATING_TIMEOUT_NORMAL
+
+def _fmt_deadline_teh(deadline) -> str:
+    try:
+        return datetime.fromtimestamp(float(deadline), TEHRAN).strftime("%H:%M")
+    except Exception:
+        return ""
 
 def _rate_pending_valid(cid) -> bool:
     """آیا این کاربر هنوز یه پرامپت دلیلِ معتبر (منقضی‌نشده) داره؟ منقضی‌شده‌ها پاک می‌شن"""
@@ -973,7 +988,7 @@ def _resolve_creator_name(name: str, cid=None) -> str:
         print(f"[rating] resolve creator exc: {e}")
     return n
 
-def _compute_rating_state(votes: list, creator_name: str) -> dict:
+def _compute_rating_state(votes: list, creator_name: str, timed_out: bool = False) -> dict:
     eligible = _eligible_raters(creator_name)
     max_voters = max(1, len(eligible))
     # همه رای‌های ذخیره‌شده نشون داده می‌شن (حتی اگه اسم دقیقاً تو TEAM_MEMBERS نبود)
@@ -994,7 +1009,19 @@ def _compute_rating_state(votes: list, creator_name: str) -> dict:
     max_possible = total + remaining * 5
     min_possible = total + remaining * 1
     label, closed = "pending", False
-    if remaining == 0:
+    system_votes = []
+    if timed_out:
+        # مهلت تموم شده: کسی که رأی نداده ۰ می‌گیره (سیستم ثبت می‌کنه) و نتیجه با همون حد نصاب‌ها اعلام می‌شه
+        voted = {_norm_name(v.get("voter_name", "")) for v in clean}
+        for m in eligible:
+            if _norm_name(m) not in voted:
+                system_votes.append({"voter_name": m, "voter_cid": TEAM_MEMBER_IDS.get(m, ""),
+                                     "score": 0, "reason": "سیستم ثبت کرد", "system": True})
+        remaining = 0
+        max_possible = min_possible = total
+        closed = True
+        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
+    elif remaining == 0:
         closed = True
         label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
     elif max_possible < 10:
@@ -1009,27 +1036,33 @@ def _compute_rating_state(votes: list, creator_name: str) -> dict:
         "setup_b": "🔵 Setup B",
         "risky": "🔴 پرریسک",
     }.get(label, label)
+    if timed_out and label == "risky":
+        label_fa = "🔴 رد شد (زیر حد نصاب Setup)"
     return {
         "total": total, "voters_count": n, "max_voters": max_voters,
         "remaining": remaining, "closed": closed, "label": label,
-        "label_fa": label_fa, "votes": clean,
+        "label_fa": label_fa, "votes": clean + system_votes,
         "max_possible": max_possible, "min_possible": min_possible,
+        "timed_out": timed_out, "system_count": len(system_votes),
     }
 
-def _build_rating_section(state: dict) -> str:
+def _build_rating_section(state: dict, deadline=None) -> str:
     lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>"]
     lines.append(f"مجموع: <b>{state['total']}</b>  ·  {state['voters_count']}/{state['max_voters']} رای")
     lines.append(state["label_fa"])
+    if state.get("timed_out"):
+        lines.append("⏱ مهلت رأی‌گیری تموم شد — کسانی که رأی ندادن ۰ ثبت شد")
     if state["votes"]:
         lines.append("")
         for v in state["votes"]:
-            why = (v.get("reason") or "").strip()
+            why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
             sc = v.get("score", "?")
-            nm = v.get("voter_name", "—")
+            nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"]:
         lines.append("")
-        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
+        dl = _fmt_deadline_teh(deadline) if deadline else ""
+        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>" + (f"  ·  ⏱ مهلت تا {dl}" if dl else ""))
     return "\n".join(lines)
 
 def _build_rating_section_cancelled(state: dict) -> str:
@@ -1105,6 +1138,9 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     msg_map = _load_fired_msg_map(alert_id)
     if msg_map.get("__rating_cancelled__") == "1":
         return state  # آلارم false شده — پیام نباید دوباره به حالت رأی‌گیری برگرده
+    if msg_map.get("__rating_timeout__") == "1":
+        # مهلت تموم شده — پیام نباید دوباره به حالت رأی‌گیری باز برگرده
+        state = _compute_rating_state(votes, creator_name, timed_out=True)
     if extra_chat_msg:
         ec, em = extra_chat_msg
         if ec and em:
@@ -1121,7 +1157,7 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         # حتی بدون پایه، حداقل تلاش کن پیام کلیک‌شده رو با فقط بخش امتیاز ادیت نکن — بی‌فایده‌ست
         return state
     base = _strip_rating_section(base)
-    full_text = base + _build_rating_section(state)
+    full_text = base + _build_rating_section(state, msg_map.get("__rating_deadline__"))
     kb = _rating_keyboard(alert_id, state)
     targets = [(k, v) for k, v in msg_map.items() if not str(k).startswith("__")]
     print(f"[rating] will edit {len(targets)} chats: {[t[0] for t in targets]}")
@@ -1168,10 +1204,13 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
         "✅ <b>نتیجه امتیازدهی</b>", str(tag), state["label_fa"],
         f"مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}", "",
     ]
+    if state.get("timed_out"):
+        body.insert(3, "⏱ مهلت رأی‌گیری تموم شد — رأی‌ندادن‌ها ۰ ثبت شد")
     for v in state["votes"]:
-        why = (v.get("reason") or "").strip()
-        body.append(f"• {v.get('voter_name','—')}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
-    body += ["", f"👤 سازنده: {creator_name or '—'}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
+        why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
+        nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
+        body.append(f"• {nm}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
+    body += ["", f"👤 سازنده: {_hesc.escape(str(creator_name or '—'), quote=False)}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
     for tc, tm in list(msg_map.items()):
@@ -1248,7 +1287,8 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
         if _mm.get("__rating_cancelled__") == "1":
             return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
         creator_name = _resolve_creator_name(creator_name or _mm.get("__creator__", ""))
-        state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name)
+        state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name,
+                                      timed_out=(_mm.get("__rating_timeout__") == "1"))
         if not state["closed"]:
             return
         with _rating_result_notified_lock:
@@ -1259,11 +1299,55 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
     except Exception as e:
         print(f"[rating] try_notify exc: {e}")
 
+def _rate_timeout_close(alert_id: str):
+    """مهلت رأی‌گیری تموم شد: رأی‌های ثبت‌شده می‌مونن، رأی‌ندادن‌ها ۰ (سیستم ثبت کرد)، پیام بسته و نتیجه اعلام می‌شه"""
+    try:
+        token = _get_token_and_cids()[0]
+        with _rating_lock_for(alert_id):
+            mm = _load_fired_msg_map(alert_id)
+            if mm.get("__rating_cancelled__") == "1" or mm.get("__rating_closed__") == "1":
+                _fired_msg_ids[alert_id] = mm  # قبلاً بسته شده (مثلاً با رأی همه یا instance دیگه)
+                return
+            creator = _resolve_creator_name(mm.get("__creator__", ""))
+            mm["__rating_timeout__"] = "1"
+            mm["__rating_closed__"] = "1"
+            _fired_msg_ids[alert_id] = mm
+            try:
+                _sb_save_fired_msgs(alert_id, mm)
+            except Exception as e:
+                print(f"[rating] timeout save map exc: {e}")
+            state = _refresh_rating_messages(token, alert_id, creator)
+            print(f"[rating] ⏱ timeout closed {alert_id}: total={state.get('total')} label={state.get('label')} system={state.get('system_count')}")
+        _rate_try_notify(token, alert_id, creator)
+    except Exception as e:
+        print(f"[rating] timeout close exc {alert_id}: {e}")
+
+def _rating_timeout_loop():
+    """فقط از حافظه (_fired_msg_ids) مهلت‌ها رو چک می‌کنه — تا وقتی مهلتی نگذشته هیچ درخواستی به Supabase نمی‌ره"""
+    while True:
+        try:
+            now = time.time()
+            for aid, mm in list(_fired_msg_ids.items()):
+                if not isinstance(mm, dict):
+                    continue
+                dl = mm.get("__rating_deadline__")
+                if not dl or mm.get("__rating_closed__") == "1" or mm.get("__rating_cancelled__") == "1":
+                    continue
+                try:
+                    if now >= float(dl):
+                        _rate_timeout_close(aid)
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            print(f"[rating] timeout loop exc: {e}")
+        time.sleep(RATING_TIMEOUT_CHECK_EVERY)
+
 def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
     """آلارم فوری با نظرسنجی — پیام با بخش امتیاز + دکمه‌های ۱ تا ۵ ارسال و map برای ادیت/رأی ذخیره می‌شه"""
     creator = _resolve_creator_name(creator)
     st0 = _compute_rating_state([], creator)
-    full = msg + _build_rating_section(st0)
+    _deadline = time.time() + _rating_timeout_seconds(instant=True)
+    full = msg + _build_rating_section(st0, _deadline)
     kb = _rating_keyboard(aid, st0)
     cid_to_mid = {}
     for tc in tgts:
@@ -1274,6 +1358,7 @@ def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
         cid_to_mid["__tag__"] = atag
         cid_to_mid["__text__"] = msg
         cid_to_mid["__creator__"] = creator
+        cid_to_mid["__rating_deadline__"] = _deadline
         _fired_msg_ids[aid] = cid_to_mid
         try:
             _sb_save_fired_msgs(aid, cid_to_mid)
@@ -5537,8 +5622,9 @@ def check_alerts():
                                 rows_kb.extend(_rating_keyboard(a["id"], _rate_state0))
                             return rows_kb
                         fired_msg_send = fired_msg
+                        _rate_deadline = time.time() + _rating_timeout_seconds(sym) if _is_team_alert else None
                         if _is_team_alert and _rate_state0 is not None:
-                            fired_msg_send = fired_msg + _build_rating_section(_rate_state0)
+                            fired_msg_send = fired_msg + _build_rating_section(_rate_state0, _rate_deadline)
                         fired_cid_to_mid = {}
                         if a.get("is_private") and a.get("notify_only"):
                             priv_cid = str(a["notify_only"])
@@ -5554,6 +5640,8 @@ def check_alerts():
                             fired_cid_to_mid["__tag__"] = alarm_num_tag
                             fired_cid_to_mid["__text__"] = fired_msg
                             fired_cid_to_mid["__creator__"] = _resolve_creator_name(creator)
+                            if _rate_deadline:
+                                fired_cid_to_mid["__rating_deadline__"] = _rate_deadline
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             print(f"[fire] saved msg map for {a['id']}: chats={list(fired_cid_to_mid.keys())}")
                             # همگام — تا قبل از اولین رای، map تو Supabase باشه (multi-instance)
@@ -6605,6 +6693,8 @@ print("[STARTUP] thread poll_telegram شروع شد")
 
 # ── بازیابی fired_msgs و counters از Supabase بعد از restart ──
 _sb_load_fired_msgs()
+threading.Thread(target=_rating_timeout_loop, daemon=True).start()
+print("[STARTUP] thread rating_timeout_loop شروع شد")
 _sb_load_sym_counters()
 # بازسازی کامل state از Supabase بعد از هر restart
 _sb_restore_on_startup()
