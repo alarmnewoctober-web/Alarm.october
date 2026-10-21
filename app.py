@@ -43,6 +43,88 @@ def is_crypto_symbol(sym):
     crypto_list = ['BTC','ETH','SOL','BNB','XRP','ADA','DOGE','TRX','TON','AVAX','MATIC','DOT','LINK','UNI','ATOM','LTC','SHIB','OP','ARB','NEAR','FTM','SAND','MANA']
     return any(c in sym_up for c in crypto_list)
 
+def _nearby_pip_threshold(symbol: str) -> object:
+    """آستانه نزدیکی برای پیشنهاد ستاره — فقط وب. طلا ۵۰، جفت‌ارز ۳۰، کریپتو None (چک نمی‌شه)."""
+    sym_up = (symbol or "").upper()
+    if is_crypto_symbol(sym_up):
+        return None
+    if "XAU" in sym_up or "XAG" in sym_up:
+        return 50
+    return 30
+
+def _price_distance_pips(symbol: str, p1: float, p2: float) -> float:
+    try:
+        return abs(float(p1) - float(p2)) * get_pip_multiplier(symbol)
+    except Exception:
+        return 1e18
+
+def _find_nearby_team_alerts(symbol: str, target: float, condition: str, exclude_name: str = "") -> list:
+    """آلارم‌های تیمی فعال هم‌نماد هم‌جهت در فاصله آستانه."""
+    thr = _nearby_pip_threshold(symbol)
+    if thr is None:
+        return []
+    data = load_alerts()
+    out = []
+    excl = (exclude_name or "").strip().lower()
+    for a in data.get("alerts", []):
+        if not a.get("active"):
+            continue
+        if a.get("is_private"):
+            continue
+        if (a.get("symbol") or "").upper() != (symbol or "").upper():
+            continue
+        if (a.get("condition") or "above") != (condition or "above"):
+            continue
+        if excl and (a.get("created_by") or "").strip().lower() == excl:
+            continue
+        dist = _price_distance_pips(symbol, target, a.get("target_price") or 0)
+        if dist <= thr:
+            out.append({
+                "id": a.get("id"),
+                "symbol": a.get("symbol"),
+                "target_price": a.get("target_price"),
+                "condition": a.get("condition"),
+                "created_by": a.get("created_by") or "—",
+                "created_at": a.get("created_at") or "",
+                "distance_pips": round(dist, 1),
+                "direction": "بالاتر" if float(a.get("target_price") or 0) > float(target) else (
+                    "پایین‌تر" if float(a.get("target_price") or 0) < float(target) else "هم‌قیمت"
+                ),
+                "supporters": a.get("supporters") or [],
+                "threshold": thr,
+            })
+    out.sort(key=lambda x: x["distance_pips"])
+    return out[:5]
+
+def _add_supporter_to_alert(alert_id: str, supporter_name: str) -> object:
+    """ستاره/تأیید روی آلارم موجود — برمی‌گرداند آلارم آپدیت‌شده یا None"""
+    name = (supporter_name or "").strip()
+    if not name or not alert_id:
+        return None
+    with _alerts_cache_lock:
+        data = load_alerts()
+        target = None
+        for a in data.get("alerts", []):
+            if str(a.get("id")) == str(alert_id) and a.get("active") and not a.get("is_private"):
+                target = a
+                break
+        if not target:
+            return None
+        sups = list(target.get("supporters") or [])
+        if any((s.get("name") or "").strip().lower() == name.lower() for s in sups if isinstance(s, dict)):
+            return target  # قبلاً تأیید کرده
+        if (target.get("created_by") or "").strip().lower() == name.lower():
+            return target  # سازنده خودش
+        sups.append({"name": name, "at": now_teh()})
+        target["supporters"] = sups
+        save_alerts(data)
+    # persist
+    try:
+        _sb_upsert_alert(target)
+    except Exception as e:
+        print(f"[support] upsert exc: {e}")
+    return target
+
 def _empty_alerts():
     return {
         "alerts": [], "archive": [], "telegram": {"bot_token": "", "chat_ids": []},
@@ -93,6 +175,8 @@ def _sb_upsert_alert(a):
             payload["expires_at"] = a["expires_at"]
         if a.get("expired_at") is not None:
             payload["expired_at"] = a["expired_at"]
+        if a.get("supporters") is not None:
+            payload["supporters"] = a.get("supporters") or []
 
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/alerts",
@@ -337,6 +421,7 @@ def _sb_load_all_alerts():
                 "last_checked": row.get("last_checked"),
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
+                "supporters":   row.get("supporters") or [],
             }
             status = row.get("status","active")
             if status == "fired" or row.get("fired_at"):
@@ -897,7 +982,7 @@ def _compute_rating_state(votes: list, creator_name: str) -> dict:
     n = len(clean)
     remaining = max(0, max_voters - n)
     max_possible = total + remaining * 5
-    min_possible = total + remaining * 0  # رای ۰ هم مجاز است
+    min_possible = total + remaining * 1
     label, closed = "pending", False
     if remaining == 0:
         closed = True
@@ -931,27 +1016,18 @@ def _build_rating_section(state: dict) -> str:
             why = (v.get("reason") or "").strip()
             sc = v.get("score", "?")
             nm = v.get("voter_name", "—")
-            try:
-                sc_i = int(sc)
-            except Exception:
-                sc_i = -1
-            if sc_i == 0:
-                sc_txt = "❌ مخالف"
-            else:
-                sc_txt = f"{sc}/5"
-            lines.append(f"• <b>{nm}</b>: {sc_txt}" + (f" — <i>{why}</i>" if why else ""))
+            lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"]:
         lines.append("")
-        lines.append("<i>❌ مخالف · یا امتیاز ۱ تا ۵</i>")
+        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
     if state.get("closed"):
         return []
     aid = str(alert_id)
-    # ۰ = مخالف کامل (بدون امتیاز) — بعد طیف قرمز→سبز
+    # تلگرام رنگ واقعی دکمه نداره — با ایموجی طیف قرمز→سبز
     return [[
-        {"text": "❌ 0", "callback_data": f"rate:{aid}:0"},
         {"text": "🔴 1", "callback_data": f"rate:{aid}:1"},
         {"text": "🟠 2", "callback_data": f"rate:{aid}:2"},
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
@@ -2384,7 +2460,7 @@ def _do_update(upd, token):
                         except ValueError:
                             rt_score = 0
                         print(f"[rating] click aid={rt_aid} score={rt_score} cid={cbq_cid}")
-                        if not rt_aid or rt_score not in (0, 1, 2, 3, 4, 5):
+                        if not rt_aid or rt_score not in (1, 2, 3, 4, 5):
                             answer_callback(token_cbq, cbq_id, "امتیاز نامعتبر")
                         else:
                             clicker_id_rt = str(cbq.get("from", {}).get("id", ""))
@@ -5371,6 +5447,16 @@ def check_alerts():
                         assignee_line = ""
                         created_at_raw = a.get("created_at", "")
                         created_label = f" | 📅 ثبت: <i>{created_at_raw[:16]}</i>" if created_at_raw else ""
+                        _sups = a.get("supporters") or []
+                        _sup_names = []
+                        for _su in _sups:
+                            if isinstance(_su, dict) and _su.get("name"):
+                                _sup_names.append(str(_su["name"]))
+                            elif isinstance(_su, str) and _su.strip():
+                                _sup_names.append(_su.strip())
+                        supporters_line = ""
+                        if _sup_names:
+                            supporters_line = "\n⭐ تأیید ناحیه توسط: <b>" + "، ".join(_sup_names) + "</b>"
                         fired_msg = (
                             f"🚨 <b>آلارم قیمت!</b>\n\n"
                             f"💰 <b>#{sym}</b> — {arrow}\n"
@@ -5381,6 +5467,7 @@ def check_alerts():
                             f"📏 فاصله: <b>{dist}</b>"
                             f"{cmt}"
                             f"{private_label}"
+                            f"{supporters_line}"
                             f"{assignee_line}\n\n⏰ {now_pretty()} (تهران){created_label}"
                         )
                         assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
@@ -5540,10 +5627,25 @@ def add_alert():
     sym = body.get("symbol","").upper().strip()
     atype = body.get("type","forex")
     tgt = float(body.get("target_price", 0))
+    condition = body.get("condition","above")
     creator = body.get("creator", "").strip()
     pin = body.get("pin", "").strip()
     if not _is_name_approved(creator, pin):
         return jsonify({"ok": False, "error": "این نام هنوز از طرف ادمین تایید نشده. لطفاً ابتدا از طریق ربات تلگرام (/start) درخواست فعال‌سازی بدید."}), 403
+
+    # موافقت با ناحیه موجود (ستاره) — فقط وب
+    support_id = str(body.get("support_alert_id") or "").strip()
+    if support_id:
+        updated = _add_supporter_to_alert(support_id, creator)
+        if not updated:
+            return jsonify({"ok": False, "error": "آلارم مورد نظر پیدا نشد یا غیرفعال/شخصی است."}), 404
+        return jsonify({
+            "ok": True,
+            "supported": True,
+            "alert": updated,
+            "message": f"⭐ تأیید شما روی ناحیه {updated.get('created_by')} ثبت شد."
+        })
+
     # آلارم شخصی فقط برای کسایی که از پنل ادمین/تلگرام دسترسیش رو گرفتن — وگرنه سایلنت عادی ثبت می‌شه
     is_private = False
     private_cid = None
@@ -5552,6 +5654,21 @@ def add_alert():
         if u_priv and (u_priv.get("private_access") or str(u_priv.get("chat_id", "")) == str(YOUR_CHAT_ID)):
             is_private = True
             private_cid = str(u_priv.get("chat_id", ""))
+
+    force_new = bool(body.get("force_new", False))
+    # چک نزدیکی — فقط تیمی، فقط وقتی force_new نیست
+    if not is_private and not force_new and tgt > 0:
+        nearby = _find_nearby_team_alerts(sym, tgt, condition, exclude_name=creator)
+        if nearby:
+            thr = nearby[0].get("threshold")
+            return jsonify({
+                "ok": False,
+                "needs_confirm": True,
+                "threshold_pips": thr,
+                "nearby": nearby,
+                "message": "نزدیک این قیمت، آلارم تیمی دیگری هست. جدید ثبت کنید یا همان ناحیه را تأیید (ستاره) کنید."
+            }), 409
+
     cur = get_price(sym, atype) if (atype!="forex" or is_forex_market_open()) else None
     expire_days = body.get("expire_days")
     expires_at = None
@@ -5563,18 +5680,17 @@ def add_alert():
         expires_at = (datetime.now(TEHRAN) + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S")
     a = {
         "id": str(int(time.time() * 1000)), "symbol": sym, "type": atype,
-        "target_price": tgt, "condition": body.get("condition","above"),
+        "target_price": tgt, "condition": condition,
         "comment": body.get("comment","").strip(), "active": True,
         "created_by": creator or "ناشناس",
         "is_private": is_private,
         "private_cid": private_cid,
         "notify_only": private_cid,
         "expires_at": expires_at,
+        "supporters": [],
         "last_price": cur, "last_checked": now_teh() if cur else None,
         "created_at": now_teh()
     }
-    # قفل: خوندن، اضافه‌کردن، و ذخیره باید یه عملیات atomic باشه —
-    # وگرنه اگه check_alerts هم‌زمان کش رو رفرش کنه، یکی از تغییرات گم می‌شه
     with _alerts_cache_lock:
         data = load_alerts()
         data["alerts"].append(a)
