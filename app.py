@@ -601,6 +601,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://erwimqqskkzcsayvhxot.supa
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GOLD_BOT_TOKEN = os.environ.get("GOLD_BOT_TOKEN", "")  # ربات جدا و مخصوص طلا (تستی)
+# ربات «📡 سیگنال نهایی»: فقط نتیجه‌ی Setup A/B برای اجراکننده‌ها. اگه FINAL_BOT_TOKEN ست نشده، همون ربات قبلی (GOLD_BOT_TOKEN) استفاده می‌شه
+FINAL_BOT_TOKEN = os.environ.get("FINAL_BOT_TOKEN", "") or GOLD_BOT_TOKEN
 
 def _sb_h():
     return {
@@ -1213,6 +1215,17 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
     body += ["", f"👤 سازنده: {_hesc.escape(str(creator_name or '—'), quote=False)}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
+    # ✅ Setup A/B → فقط تو ربات «سیگنال نهایی» (ربات اصلی شلوغ نشه). پرریسک و بقیه‌ی موارد مثل قبل تو ربات اصلی.
+    if state.get("label") in ("setup_a", "setup_b") and FINAL_BOT_TOKEN:
+        try:
+            ok_n = _send_final_signal(_build_final_signal_text(alert_id, state, creator_name))
+        except Exception as e:
+            ok_n = 0
+            print(f"[finalbot] send exc: {e}")
+        if ok_n > 0:
+            print(f"[finalbot] ✅ {state.get('label')} {alert_id} → {ok_n} مشترک")
+            return
+        print(f"[finalbot] ⚠️ مشترکی نبود/ارسال نشد — نتیجه تو ربات اصلی فرستاده می‌شه ({alert_id})")
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
             continue
@@ -6630,27 +6643,69 @@ def _add_gold_bot_subscriber(chat_id: str):
     return True
 
 def _broadcast_to_gold_bot(text: str):
-    """این پیام رو مستقل از mute بودن ربات اصلی، به همه‌ی مشترکین ربات طلا می‌فرسته"""
-    if not GOLD_BOT_TOKEN:
-        return
+    """(قدیمی) همه‌ی مشترکین ربات دوم — الان برای سیگنال نهایی از _send_final_signal استفاده می‌شه"""
+    _send_final_signal(text)
+
+def _send_final_signal(text: str) -> int:
+    """متن رو به همه‌ی مشترکین ربات «سیگنال نهایی» می‌فرسته؛ تعداد ارسال موفق رو برمی‌گردونه"""
+    if not FINAL_BOT_TOKEN:
+        return 0
     with _gold_bot_lock:
         subs = list(_gold_bot_subscribers)
+    ok = 0
     for cid in subs:
         try:
-            send_tg(GOLD_BOT_TOKEN, cid, text)
+            r = requests.post(
+                f"https://api.telegram.org/bot{FINAL_BOT_TOKEN}/sendMessage",
+                json={"chat_id": str(cid), "text": text, "parse_mode": "HTML"},
+                timeout=10, headers=H)
+            if r.status_code == 200:
+                ok += 1
+            else:
+                print(f"[finalbot] send {cid}: {r.status_code} {r.text[:100]}")
         except Exception as e:
-            print(f"[goldbot] send error to {cid}: {e}")
+            print(f"[finalbot] send error to {cid}: {e}")
+    return ok
+
+def _build_final_signal_text(alert_id: str, state: dict, creator_name: str) -> str:
+    mm = _fired_msg_ids.get(alert_id, {}) or {}
+    head = "🟢 <b>سیگنال نهایی — Setup A</b>" if state.get("label") == "setup_a" else "🔵 <b>سیگنال نهایی — Setup B</b>"
+    base = (mm.get("__text__") or mm.get("__tag__") or str(alert_id))
+    lines = [head, "", base, "", "────────────",
+             f"⭐ مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}"]
+    if state.get("timed_out"):
+        lines.append("⏱ مهلت رأی‌گیری تموم شد — رأی‌ندادن‌ها ۰ ثبت شد")
+    lines.append("")
+    for v in state.get("votes", []):
+        why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
+        nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
+        lines.append(f"• {nm}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
+    lines += ["", f"👤 سازنده: {_hesc.escape(str(creator_name or '—'), quote=False)}"]
+    text = "\n".join(lines)
+    if len(text) > 3900:  # سقف طول پیام تلگرام — فقط تگ آلارم + نتیجه
+        text = "\n".join([head, "", str(mm.get("__tag__") or alert_id), "",
+                          f"⭐ مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}"])
+    return text
+
+def _final_bot_allowed_cids() -> set:
+    """فقط اعضای تیم / چت‌های تاییدشده‌ی ربات اصلی می‌تونن مشترک بشن — که سیگنال‌ها دست غریبه نیفته"""
+    allowed = set(str(x) for x in TEAM_MEMBER_IDS.values() if x)
+    try:
+        allowed |= set(str(x) for x in _get_token_and_cids()[1])
+    except Exception:
+        pass
+    return allowed
 
 def poll_gold_bot():
-    """حلقه‌ی polling ساده‌ی ربات طلا — فقط /start رو مدیریت می‌کنه"""
-    if not GOLD_BOT_TOKEN:
-        print("[goldbot] GOLD_BOT_TOKEN تنظیم نشده — این ربات غیرفعاله")
+    """حلقه‌ی polling ربات «سیگنال نهایی» — فقط /start رو مدیریت می‌کنه"""
+    if not FINAL_BOT_TOKEN:
+        print("[finalbot] FINAL_BOT_TOKEN/GOLD_BOT_TOKEN تنظیم نشده — این ربات غیرفعاله")
         return
     last_id = 0
     while True:
         try:
             r = requests.get(
-                f"https://api.telegram.org/bot{GOLD_BOT_TOKEN}/getUpdates",
+                f"https://api.telegram.org/bot{FINAL_BOT_TOKEN}/getUpdates",
                 params={"offset": last_id + 1, "timeout": 20, "limit": 100},
                 timeout=30, headers=H)
             if r.status_code != 200:
@@ -6664,12 +6719,15 @@ def poll_gold_bot():
                 if cid is None:
                     continue
                 if text == "/start":
+                    if str(cid) not in _final_bot_allowed_cids():
+                        send_tg(FINAL_BOT_TOKEN, cid, "⛔ دسترسی نداری. اول تو ربات اصلی تیم عضو شو، بعد دوباره /start بزن.")
+                        continue
                     is_new = _add_gold_bot_subscriber(cid)
-                    welcome = ("🟡 <b>ربات آلارم طلا</b>\n\n"
-                               "از این به بعد هر آلارم طلا (فوری و معمولی) اینجا برات میاد.")
-                    send_tg(GOLD_BOT_TOKEN, cid, welcome if is_new else "✅ از قبل مشترک بودی، همچنان فعاله.")
+                    welcome = ("📡 <b>سیگنال نهایی</b>\n\n"
+                               "از این به بعد نتیجه‌ی نهایی ستاپ‌های <b>A</b> و <b>B</b> (بعد از رأی‌گیری تیم) اینجا برات میاد.")
+                    send_tg(FINAL_BOT_TOKEN, cid, welcome if is_new else "✅ از قبل مشترک بودی، همچنان فعاله.")
         except Exception as e:
-            print(f"[goldbot] poll error: {e}")
+            print(f"[finalbot] poll error: {e}")
         time.sleep(5)
 
 
@@ -6685,7 +6743,7 @@ def _delete_webhook_if_any(token):
 
 _main_tok, _, _ = _get_token_and_cids()
 _delete_webhook_if_any(_main_tok)
-_delete_webhook_if_any(GOLD_BOT_TOKEN)
+_delete_webhook_if_any(FINAL_BOT_TOKEN)
 
 threading.Thread(target=poll_telegram, daemon=True).start()
 threading.Thread(target=poll_gold_bot, daemon=True).start()
