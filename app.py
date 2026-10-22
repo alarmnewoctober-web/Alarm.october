@@ -1940,6 +1940,15 @@ def answer_callback(token, callback_id, text=""):
             timeout=10, headers=H)
     except: pass
 
+def _send_temp(token, cid, text, ttl=6):
+    """پیام موقت: می‌فرسته و بعد از ttl ثانیه خودش پاک می‌شه (برای تأییدهای نظرسنجی که ربات رو شلوغ نکنن)"""
+    try:
+        mid = send_tg_keyboard(token, cid, text, None, track=False)
+        if mid:
+            _delete_msg_after(token, str(cid), mid, delay=ttl)
+    except Exception as e:
+        print(f"[temp] send exc: {e}")
+
 def _delete_msg_after(token, cid, msg_id, delay=120):
     """پیام رو بعد از delay ثانیه پاک کن"""
     def _do():
@@ -2649,6 +2658,8 @@ def _do_update(upd, token):
                                                     token_cbq, cbq_cid,
                                                     "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score,
                                                     [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % rt_aid}]])
+                                                if _prompt_mid:
+                                                    _delete_msg_after(token_cbq, cbq_cid, _prompt_mid, delay=RATE_REASON_TTL + 5)
                                                 _pending_rate[clicker_id_rt] = {
                                                     "alert_id": rt_aid, "score": rt_score,
                                                     "voter_name": voter_name_rt, "creator": creator_rt,
@@ -4838,11 +4849,14 @@ def _do_update(upd, token):
                             _refresh_rating_messages(token, rt_aid, creator_rt)
                             if pr.get("prompt_mid"):
                                 _delete_msg_after(token, cid, pr["prompt_mid"], delay=0)
-                            send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
+                            # کامنت خود کاربر رو پاک کن (تو پیام آلارم نمایش داده می‌شه) — تو گروه فقط اگه ربات اجازه‌ی حذف داشته باشه
+                            if user_msg_id:
+                                _delete_msg_after(token, cid, user_msg_id, delay=0)
+                            _send_temp(token, cid, "✅ دلیل ثبت شد", ttl=4)
                             threading.Thread(target=_rate_try_notify, args=(token, rt_aid, creator_rt), daemon=True).start()
                         else:
                             _pending_rate[cid] = pr  # دوباره فرصت بده
-                            send_tg(token, cid, "❌ دلیل ثبت نشد، دوباره بفرست یا «رد کردن» رو بزن")
+                            _send_temp(token, cid, "❌ دلیل ثبت نشد، دوباره بفرست یا «رد کردن» رو بزن", ttl=15)
 
                 elif cid in _pending_alarm and not txt.startswith("/"):
                     step = _pending_alarm[cid]["step"]
