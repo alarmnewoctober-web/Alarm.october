@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from flask import Flask, request, jsonify, send_from_directory
 from datetime import datetime, timedelta
 import re
-import html as _hesc
 
 app = Flask(__name__, static_folder='static')
 VERSION = "8.0"
@@ -43,88 +42,6 @@ def is_crypto_symbol(sym):
     sym_up = sym.upper()
     crypto_list = ['BTC','ETH','SOL','BNB','XRP','ADA','DOGE','TRX','TON','AVAX','MATIC','DOT','LINK','UNI','ATOM','LTC','SHIB','OP','ARB','NEAR','FTM','SAND','MANA']
     return any(c in sym_up for c in crypto_list)
-
-def _nearby_pip_threshold(symbol: str) -> object:
-    """آستانه نزدیکی برای پیشنهاد ستاره — فقط وب. طلا ۵۰، جفت‌ارز ۳۰، کریپتو None (چک نمی‌شه)."""
-    sym_up = (symbol or "").upper()
-    if is_crypto_symbol(sym_up):
-        return None
-    if "XAU" in sym_up or "XAG" in sym_up:
-        return 50
-    return 30
-
-def _price_distance_pips(symbol: str, p1: float, p2: float) -> float:
-    try:
-        return abs(float(p1) - float(p2)) * get_pip_multiplier(symbol)
-    except Exception:
-        return 1e18
-
-def _find_nearby_team_alerts(symbol: str, target: float, condition: str, exclude_name: str = "") -> list:
-    """آلارم‌های تیمی فعال هم‌نماد هم‌جهت در فاصله آستانه."""
-    thr = _nearby_pip_threshold(symbol)
-    if thr is None:
-        return []
-    data = load_alerts()
-    out = []
-    excl = (exclude_name or "").strip().lower()
-    for a in data.get("alerts", []):
-        if not a.get("active"):
-            continue
-        if a.get("is_private"):
-            continue
-        if (a.get("symbol") or "").upper() != (symbol or "").upper():
-            continue
-        if (a.get("condition") or "above") != (condition or "above"):
-            continue
-        if excl and (a.get("created_by") or "").strip().lower() == excl:
-            continue
-        dist = _price_distance_pips(symbol, target, a.get("target_price") or 0)
-        if dist <= thr:
-            out.append({
-                "id": a.get("id"),
-                "symbol": a.get("symbol"),
-                "target_price": a.get("target_price"),
-                "condition": a.get("condition"),
-                "created_by": a.get("created_by") or "—",
-                "created_at": a.get("created_at") or "",
-                "distance_pips": round(dist, 1),
-                "direction": "بالاتر" if float(a.get("target_price") or 0) > float(target) else (
-                    "پایین‌تر" if float(a.get("target_price") or 0) < float(target) else "هم‌قیمت"
-                ),
-                "supporters": a.get("supporters") or [],
-                "threshold": thr,
-            })
-    out.sort(key=lambda x: x["distance_pips"])
-    return out[:5]
-
-def _add_supporter_to_alert(alert_id: str, supporter_name: str) -> object:
-    """ستاره/تأیید روی آلارم موجود — برمی‌گرداند آلارم آپدیت‌شده یا None"""
-    name = (supporter_name or "").strip()
-    if not name or not alert_id:
-        return None
-    with _alerts_cache_lock:
-        data = load_alerts()
-        target = None
-        for a in data.get("alerts", []):
-            if str(a.get("id")) == str(alert_id) and a.get("active") and not a.get("is_private"):
-                target = a
-                break
-        if not target:
-            return None
-        sups = list(target.get("supporters") or [])
-        if any((s.get("name") or "").strip().lower() == name.lower() for s in sups if isinstance(s, dict)):
-            return target  # قبلاً تأیید کرده
-        if (target.get("created_by") or "").strip().lower() == name.lower():
-            return target  # سازنده خودش
-        sups.append({"name": name, "at": now_teh()})
-        target["supporters"] = sups
-        save_alerts(data)
-    # persist
-    try:
-        _sb_upsert_alert(target)
-    except Exception as e:
-        print(f"[support] upsert exc: {e}")
-    return target
 
 def _empty_alerts():
     return {
@@ -176,10 +93,6 @@ def _sb_upsert_alert(a):
             payload["expires_at"] = a["expires_at"]
         if a.get("expired_at") is not None:
             payload["expired_at"] = a["expired_at"]
-        if a.get("supporters") is not None:
-            payload["supporters"] = a.get("supporters") or []
-        if a.get("nearby_refs"):
-            payload["nearby_refs"] = a.get("nearby_refs")
 
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/alerts",
@@ -187,13 +100,11 @@ def _sb_upsert_alert(a):
             json=payload, timeout=10)
         if r.status_code not in (200,201,204):
             err_text = r.text
-            # اگه ستون پیدا نشد، بدون اون فیلد دوباره تلاش کن (تا ۳ بار — چون الان دو ستون اختیاری داریم)
+            # اگه ستون پیدا نشد، بدون اون فیلد دوباره تلاش کن
             if r.status_code == 400 and "PGRST204" in err_text:
                 import re as _re
-                for _try in range(3):
-                    missing = _re.search(r"Could not find the '([^']+)'", err_text)
-                    if not missing:
-                        break
+                missing = _re.search(r"Could not find the '([^']+)'", err_text)
+                if missing:
                     col = missing.group(1)
                     print(f"[alerts] ستون '{col}' توی DB نیست — بدون اون retry میکنیم")
                     payload.pop(col, None)
@@ -201,13 +112,9 @@ def _sb_upsert_alert(a):
                         f"{SUPABASE_URL}/rest/v1/alerts",
                         headers={**_sb_h(), "Prefer": "resolution=merge-duplicates,return=minimal"},
                         json=payload, timeout=10)
-                    if r2.status_code in (200,201,204):
-                        return
-                    err_text = r2.text
-                    if not (r2.status_code == 400 and "PGRST204" in err_text):
-                        break
-                print(f"[alerts] upsert {a['id']} retry failed: {err_text[:120]}")
-                return
+                    if r2.status_code not in (200,201,204):
+                        print(f"[alerts] upsert {a['id']} retry failed: {r2.status_code} {r2.text[:120]}")
+                    return
             print(f"[alerts] upsert {a['id']}: {r.status_code} {r.text[:120]}")
     except Exception as e:
         print(f"[alerts] upsert error: {e}")
@@ -430,8 +337,6 @@ def _sb_load_all_alerts():
                 "last_checked": row.get("last_checked"),
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
-                "supporters":   row.get("supporters") or [],
-                "nearby_refs":  row.get("nearby_refs") or [],
             }
             status = row.get("status","active")
             if status == "fired" or row.get("fired_at"):
@@ -601,8 +506,6 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://erwimqqskkzcsayvhxot.supa
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GOLD_BOT_TOKEN = os.environ.get("GOLD_BOT_TOKEN", "")  # ربات جدا و مخصوص طلا (تستی)
-# ربات «📡 سیگنال نهایی»: فقط نتیجه‌ی Setup A/B برای اجراکننده‌ها. اگه FINAL_BOT_TOKEN ست نشده، همون ربات قبلی (GOLD_BOT_TOKEN) استفاده می‌شه
-FINAL_BOT_TOKEN = os.environ.get("FINAL_BOT_TOKEN", "") or GOLD_BOT_TOKEN
 
 def _sb_h():
     return {
@@ -879,21 +782,6 @@ _rating_result_notified: set = set()  # alert_idهایی که نتیجه نها�
 _rating_result_notified_lock = threading.Lock()
 RATE_REASON_TTL = 300  # ثانیه — مهلت نوشتن دلیل بعد از رای
 RATE_NOTIFY_WAIT = 120  # ثانیه — حداکثر صبر برای دلیلِ آخرین رأی‌دهنده قبل از ارسال نتیجه
-RATING_TIMEOUT_NORMAL = 3600  # ثانیه — مهلت رأی‌گیری آلارم معمولی فارکس/کریپتو (۱ ساعت)
-RATING_TIMEOUT_FAST = 900     # ثانیه — مهلت رأی‌گیری آلارم فوری/SOS و هر آلارم طلا (۱۵ دقیقه)
-RATING_TIMEOUT_CHECK_EVERY = 30  # ثانیه — هر چند ثانیه یه بار مهلت‌ها (فقط از حافظه) چک می‌شن
-
-def _rating_timeout_seconds(symbol: str = "", instant: bool = False) -> int:
-    """آلارم فوری/SOS و طلا (معمولی یا فوری) ۱۵ دقیقه؛ بقیه‌ی فارکس و کریپتو ۱ ساعت"""
-    if instant or "XAU" in (symbol or "").upper() or "GOLD" in (symbol or "").upper():
-        return RATING_TIMEOUT_FAST
-    return RATING_TIMEOUT_NORMAL
-
-def _fmt_deadline_teh(deadline) -> str:
-    try:
-        return datetime.fromtimestamp(float(deadline), TEHRAN).strftime("%H:%M")
-    except Exception:
-        return ""
 
 def _rate_pending_valid(cid) -> bool:
     """آیا این کاربر هنوز یه پرامپت دلیلِ معتبر (منقضی‌نشده) داره؟ منقضی‌شده‌ها پاک می‌شن"""
@@ -990,7 +878,7 @@ def _resolve_creator_name(name: str, cid=None) -> str:
         print(f"[rating] resolve creator exc: {e}")
     return n
 
-def _compute_rating_state(votes: list, creator_name: str, timed_out: bool = False) -> dict:
+def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = False) -> dict:
     eligible = _eligible_raters(creator_name)
     max_voters = max(1, len(eligible))
     # همه رای‌های ذخیره‌شده نشون داده می‌شن (حتی اگه اسم دقیقاً تو TEAM_MEMBERS نبود)
@@ -1011,19 +899,7 @@ def _compute_rating_state(votes: list, creator_name: str, timed_out: bool = Fals
     max_possible = total + remaining * 5
     min_possible = total + remaining * 1
     label, closed = "pending", False
-    system_votes = []
-    if timed_out:
-        # مهلت تموم شده: کسی که رأی نداده ۰ می‌گیره (سیستم ثبت می‌کنه) و نتیجه با همون حد نصاب‌ها اعلام می‌شه
-        voted = {_norm_name(v.get("voter_name", "")) for v in clean}
-        for m in eligible:
-            if _norm_name(m) not in voted:
-                system_votes.append({"voter_name": m, "voter_cid": TEAM_MEMBER_IDS.get(m, ""),
-                                     "score": 0, "reason": "سیستم ثبت کرد", "system": True})
-        remaining = 0
-        max_possible = min_possible = total
-        closed = True
-        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
-    elif remaining == 0:
+    if remaining == 0:
         closed = True
         label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
     elif max_possible < 10:
@@ -1032,52 +908,41 @@ def _compute_rating_state(votes: list, creator_name: str, timed_out: bool = Fals
         closed, label = True, "setup_a"
     elif min_possible >= 10 and max_possible < 15:
         closed, label = True, "setup_b"
+    manual = False
+    if force_closed and not closed:
+        # بستن دستی: با رأی‌های موجود محاسبه کن (همون آستانه‌های ۱۵ / ۱۰ روی مجموع فعلی)
+        manual, closed = True, True
+        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
     label_fa = {
         "pending": "⏳ در حال جمع‌آوری رای",
         "setup_a": "🟢 Setup A",
         "setup_b": "🔵 Setup B",
         "risky": "🔴 پرریسک",
     }.get(label, label)
-    if timed_out and label == "risky":
-        label_fa = "🔴 رد شد (زیر حد نصاب Setup)"
+    if manual:
+        label_fa += " · 🔒 بسته‌شده دستی"
     return {
+        "manual": manual,
         "total": total, "voters_count": n, "max_voters": max_voters,
         "remaining": remaining, "closed": closed, "label": label,
-        "label_fa": label_fa, "votes": clean + system_votes,
+        "label_fa": label_fa, "votes": clean,
         "max_possible": max_possible, "min_possible": min_possible,
-        "timed_out": timed_out, "system_count": len(system_votes),
     }
 
-def _build_rating_section(state: dict, deadline=None) -> str:
+def _build_rating_section(state: dict) -> str:
     lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>"]
     lines.append(f"مجموع: <b>{state['total']}</b>  ·  {state['voters_count']}/{state['max_voters']} رای")
     lines.append(state["label_fa"])
-    if state.get("timed_out"):
-        lines.append("⏱ مهلت رأی‌گیری تموم شد — کسانی که رأی ندادن ۰ ثبت شد")
     if state["votes"]:
         lines.append("")
         for v in state["votes"]:
-            why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
+            why = (v.get("reason") or "").strip()
             sc = v.get("score", "?")
-            nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
+            nm = v.get("voter_name", "—")
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"]:
         lines.append("")
-        dl = _fmt_deadline_teh(deadline) if deadline else ""
-        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>" + (f"  ·  ⏱ مهلت تا {dl}" if dl else ""))
-    return "\n".join(lines)
-
-def _build_rating_section_cancelled(state: dict) -> str:
-    """نظرسنجی بعد از false شدن آلارم: رأی‌ها و دلیل‌های ثبت‌شده تا همون لحظه می‌مونن، فقط وضعیت «لغو شد» می‌شه"""
-    lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>  —  ❌ <b>لغو شد (آلارم false شد)</b>"]
-    if state.get("votes"):
-        lines.append(f"رأی‌های ثبت‌شده تا قبل از لغو: {state['voters_count']}/{state['max_voters']}  ·  مجموع: <b>{state['total']}</b>")
-        lines.append("")
-        for v in state["votes"]:
-            why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
-            sc = v.get("score", "?")
-            nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
-            lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
+        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
@@ -1091,6 +956,8 @@ def _rating_keyboard(alert_id: str, state: dict) -> list:
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
         {"text": "🟢 4", "callback_data": f"rate:{aid}:4"},
         {"text": "💚 5", "callback_data": f"rate:{aid}:5"},
+    ], [
+        {"text": "🔒 بستن دستی و محاسبه", "callback_data": f"rate_close:{aid}"},
     ]]
 
 def _load_fired_msg_map(alert_id: str) -> dict:
@@ -1140,9 +1007,8 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     msg_map = _load_fired_msg_map(alert_id)
     if msg_map.get("__rating_cancelled__") == "1":
         return state  # آلارم false شده — پیام نباید دوباره به حالت رأی‌گیری برگرده
-    if msg_map.get("__rating_timeout__") == "1":
-        # مهلت تموم شده — پیام نباید دوباره به حالت رأی‌گیری باز برگرده
-        state = _compute_rating_state(votes, creator_name, timed_out=True)
+    if msg_map.get("__rating_manual__") == "1":
+        state = _compute_rating_state(votes, creator_name, force_closed=True)
     if extra_chat_msg:
         ec, em = extra_chat_msg
         if ec and em:
@@ -1159,7 +1025,7 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         # حتی بدون پایه، حداقل تلاش کن پیام کلیک‌شده رو با فقط بخش امتیاز ادیت نکن — بی‌فایده‌ست
         return state
     base = _strip_rating_section(base)
-    full_text = base + _build_rating_section(state, msg_map.get("__rating_deadline__"))
+    full_text = base + _build_rating_section(state)
     kb = _rating_keyboard(alert_id, state)
     targets = [(k, v) for k, v in msg_map.items() if not str(k).startswith("__")]
     print(f"[rating] will edit {len(targets)} chats: {[t[0] for t in targets]}")
@@ -1204,28 +1070,14 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
     tag = (_fired_msg_ids.get(alert_id) or {}).get("__tag__", alert_id)
     body = [
         "✅ <b>نتیجه امتیازدهی</b>", str(tag), state["label_fa"],
-        f"مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}", "",
+        f"مجموع امتیاز: <b>{state['total']}</b> از {(state['voters_count'] if state.get('manual') else state['max_voters']) * 5}", "",
     ]
-    if state.get("timed_out"):
-        body.insert(3, "⏱ مهلت رأی‌گیری تموم شد — رأی‌ندادن‌ها ۰ ثبت شد")
     for v in state["votes"]:
-        why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
-        nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
-        body.append(f"• {nm}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
-    body += ["", f"👤 سازنده: {_hesc.escape(str(creator_name or '—'), quote=False)}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
+        why = (v.get("reason") or "").strip()
+        body.append(f"• {v.get('voter_name','—')}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
+    body += ["", f"👤 سازنده: {creator_name or '—'}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
-    # ✅ Setup A/B → فقط تو ربات «سیگنال نهایی» (ربات اصلی شلوغ نشه). پرریسک و بقیه‌ی موارد مثل قبل تو ربات اصلی.
-    if state.get("label") in ("setup_a", "setup_b") and FINAL_BOT_TOKEN:
-        try:
-            ok_n = _send_final_signal(_build_final_signal_text(alert_id, state, creator_name))
-        except Exception as e:
-            ok_n = 0
-            print(f"[finalbot] send exc: {e}")
-        if ok_n > 0:
-            print(f"[finalbot] ✅ {state.get('label')} {alert_id} → {ok_n} مشترک")
-            return
-        print(f"[finalbot] ⚠️ مشترکی نبود/ارسال نشد — نتیجه تو ربات اصلی فرستاده می‌شه ({alert_id})")
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
             continue
@@ -1269,14 +1121,7 @@ def _rate_cancel_poll(alert_id: str):
         base = _strip_rating_section(msg_map.get("__text__", "") or msg_map.get("__text_rated__", ""))
         if not base:
             return
-        # رأی‌ها و دلیل‌های ثبت‌شده تا قبل از false رو از DB می‌خونیم و تو پیام نگه می‌داریم
-        try:
-            _cn = _resolve_creator_name(msg_map.get("__creator__", ""))
-            _st_c = _compute_rating_state(_sb_load_ratings(alert_id), _cn)
-        except Exception as e:
-            print(f"[rating] cancel load votes exc: {e}")
-            _st_c = {"votes": []}
-        new_text = base + _build_rating_section_cancelled(_st_c)
+        new_text = base + "\n\n────────────\n⭐ <b>نظرسنجی</b>: ❌ لغو شد (آلارم false شد)"
         for tc, tm in list(msg_map.items()):
             if str(tc).startswith("__"):
                 continue
@@ -1301,7 +1146,7 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
             return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
         creator_name = _resolve_creator_name(creator_name or _mm.get("__creator__", ""))
         state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name,
-                                      timed_out=(_mm.get("__rating_timeout__") == "1"))
+                                      force_closed=(_mm.get("__rating_manual__") == "1"))
         if not state["closed"]:
             return
         with _rating_result_notified_lock:
@@ -1312,55 +1157,11 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
     except Exception as e:
         print(f"[rating] try_notify exc: {e}")
 
-def _rate_timeout_close(alert_id: str):
-    """مهلت رأی‌گیری تموم شد: رأی‌های ثبت‌شده می‌مونن، رأی‌ندادن‌ها ۰ (سیستم ثبت کرد)، پیام بسته و نتیجه اعلام می‌شه"""
-    try:
-        token = _get_token_and_cids()[0]
-        with _rating_lock_for(alert_id):
-            mm = _load_fired_msg_map(alert_id)
-            if mm.get("__rating_cancelled__") == "1" or mm.get("__rating_closed__") == "1":
-                _fired_msg_ids[alert_id] = mm  # قبلاً بسته شده (مثلاً با رأی همه یا instance دیگه)
-                return
-            creator = _resolve_creator_name(mm.get("__creator__", ""))
-            mm["__rating_timeout__"] = "1"
-            mm["__rating_closed__"] = "1"
-            _fired_msg_ids[alert_id] = mm
-            try:
-                _sb_save_fired_msgs(alert_id, mm)
-            except Exception as e:
-                print(f"[rating] timeout save map exc: {e}")
-            state = _refresh_rating_messages(token, alert_id, creator)
-            print(f"[rating] ⏱ timeout closed {alert_id}: total={state.get('total')} label={state.get('label')} system={state.get('system_count')}")
-        _rate_try_notify(token, alert_id, creator)
-    except Exception as e:
-        print(f"[rating] timeout close exc {alert_id}: {e}")
-
-def _rating_timeout_loop():
-    """فقط از حافظه (_fired_msg_ids) مهلت‌ها رو چک می‌کنه — تا وقتی مهلتی نگذشته هیچ درخواستی به Supabase نمی‌ره"""
-    while True:
-        try:
-            now = time.time()
-            for aid, mm in list(_fired_msg_ids.items()):
-                if not isinstance(mm, dict):
-                    continue
-                dl = mm.get("__rating_deadline__")
-                if not dl or mm.get("__rating_closed__") == "1" or mm.get("__rating_cancelled__") == "1":
-                    continue
-                try:
-                    if now >= float(dl):
-                        _rate_timeout_close(aid)
-                except (TypeError, ValueError):
-                    continue
-        except Exception as e:
-            print(f"[rating] timeout loop exc: {e}")
-        time.sleep(RATING_TIMEOUT_CHECK_EVERY)
-
 def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
     """آلارم فوری با نظرسنجی — پیام با بخش امتیاز + دکمه‌های ۱ تا ۵ ارسال و map برای ادیت/رأی ذخیره می‌شه"""
     creator = _resolve_creator_name(creator)
     st0 = _compute_rating_state([], creator)
-    _deadline = time.time() + _rating_timeout_seconds(instant=True)
-    full = msg + _build_rating_section(st0, _deadline)
+    full = msg + _build_rating_section(st0)
     kb = _rating_keyboard(aid, st0)
     cid_to_mid = {}
     for tc in tgts:
@@ -1371,7 +1172,6 @@ def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
         cid_to_mid["__tag__"] = atag
         cid_to_mid["__text__"] = msg
         cid_to_mid["__creator__"] = creator
-        cid_to_mid["__rating_deadline__"] = _deadline
         _fired_msg_ids[aid] = cid_to_mid
         try:
             _sb_save_fired_msgs(aid, cid_to_mid)
@@ -1939,15 +1739,6 @@ def answer_callback(token, callback_id, text=""):
             json={"callback_query_id": callback_id, "text": text},
             timeout=10, headers=H)
     except: pass
-
-def _send_temp(token, cid, text, ttl=6):
-    """پیام موقت: می‌فرسته و بعد از ttl ثانیه خودش پاک می‌شه (برای تأییدهای نظرسنجی که ربات رو شلوغ نکنن)"""
-    try:
-        mid = send_tg_keyboard(token, cid, text, None, track=False)
-        if mid:
-            _delete_msg_after(token, str(cid), mid, delay=ttl)
-    except Exception as e:
-        print(f"[temp] send exc: {e}")
 
 def _delete_msg_after(token, cid, msg_id, delay=120):
     """پیام رو بعد از delay ثانیه پاک کن"""
@@ -2658,8 +2449,6 @@ def _do_update(upd, token):
                                                     token_cbq, cbq_cid,
                                                     "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score,
                                                     [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % rt_aid}]])
-                                                if _prompt_mid:
-                                                    _delete_msg_after(token_cbq, cbq_cid, _prompt_mid, delay=RATE_REASON_TTL + 5)
                                                 _pending_rate[clicker_id_rt] = {
                                                     "alert_id": rt_aid, "score": rt_score,
                                                     "voter_name": voter_name_rt, "creator": creator_rt,
@@ -2686,6 +2475,37 @@ def _do_update(upd, token):
                             _delete_msg_after(token_cbq, cbq_cid, cbq_msg_id, delay=0)
                         if rs_aid:
                             threading.Thread(target=_rate_try_notify, args=(token_cbq, rs_aid, rs_creator), daemon=True).start()
+
+                    elif cbq_data.startswith("rate_close:"):
+                        rc_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
+                        rc_clicker = str(cbq.get("from", {}).get("id", ""))
+                        if not rc_aid:
+                            answer_callback(token_cbq, cbq_id, "نامعتبر")
+                        elif rc_clicker not in TEAM_ID_TO_NAME:
+                            answer_callback(token_cbq, cbq_id, "فقط اعضای تیم می‌تونن ببندن")
+                        else:
+                            with _rating_lock_for(rc_aid):
+                                mm_rc = _load_fired_msg_map(rc_aid)
+                                creator_rc = _resolve_creator_name(mm_rc.get("__creator__", ""))
+                                if mm_rc.get("__rating_cancelled__") == "1":
+                                    answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
+                                elif mm_rc.get("__rating_closed__") == "1":
+                                    answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
+                                elif _compute_rating_state(_sb_load_ratings(rc_aid), creator_rc)["voters_count"] == 0:
+                                    answer_callback(token_cbq, cbq_id, "هنوز هیچ رایی ثبت نشده")
+                                else:
+                                    mm_rc["__rating_closed__"] = "1"
+                                    mm_rc["__rating_manual__"] = "1"
+                                    _fired_msg_ids[rc_aid] = mm_rc
+                                    try:
+                                        _sb_save_fired_msgs(rc_aid, mm_rc)
+                                    except Exception as e:
+                                        print(f"[rating] manual close save exc: {e}")
+                                    answer_callback(token_cbq, cbq_id, "🔒 رای‌گیری بسته شد")
+                                    _fb_rc = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
+                                    _refresh_rating_messages(token_cbq, rc_aid, creator_rc,
+                                                             extra_chat_msg=(cbq_cid, cbq_msg_id), fallback_text=_fb_rc)
+                                    threading.Thread(target=_rate_try_notify, args=(token_cbq, rc_aid, creator_rc), daemon=True).start()
 
                     elif cbq_data.startswith("del_confirm:"):
                         # مرحله اول: نمایش تأیید حذف
@@ -4849,14 +4669,11 @@ def _do_update(upd, token):
                             _refresh_rating_messages(token, rt_aid, creator_rt)
                             if pr.get("prompt_mid"):
                                 _delete_msg_after(token, cid, pr["prompt_mid"], delay=0)
-                            # کامنت خود کاربر رو پاک کن (تو پیام آلارم نمایش داده می‌شه) — تو گروه فقط اگه ربات اجازه‌ی حذف داشته باشه
-                            if user_msg_id:
-                                _delete_msg_after(token, cid, user_msg_id, delay=0)
-                            _send_temp(token, cid, "✅ دلیل ثبت شد", ttl=4)
+                            send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
                             threading.Thread(target=_rate_try_notify, args=(token, rt_aid, creator_rt), daemon=True).start()
                         else:
                             _pending_rate[cid] = pr  # دوباره فرصت بده
-                            _send_temp(token, cid, "❌ دلیل ثبت نشد، دوباره بفرست یا «رد کردن» رو بزن", ttl=15)
+                            send_tg(token, cid, "❌ دلیل ثبت نشد، دوباره بفرست یا «رد کردن» رو بزن")
 
                 elif cid in _pending_alarm and not txt.startswith("/"):
                     step = _pending_alarm[cid]["step"]
@@ -5385,16 +5202,9 @@ def _sb_load_active_only():
     """
     if not SUPABASE_KEY: return None
     try:
-        _base_cols = "id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users"
         r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_base_cols},supporters,nearby_refs&limit=500",
+            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select=id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users&limit=500",
             headers=_sb_h(), timeout=10)
-        if r.status_code == 400 and ("supporters" in r.text or "nearby_refs" in r.text):
-            # ستون‌ها هنوز تو DB ساخته نشدن — بدون اون‌ها بخون (ولی ستاره/نزدیکی از دست می‌ره)
-            print("[alerts] ⚠️ ستون supporters/nearby_refs تو جدول alerts نیست — SQL مایگریشن رو اجرا کن")
-            r = requests.get(
-                f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_base_cols}&limit=500",
-                headers=_sb_h(), timeout=10)
         if r.status_code != 200:
             print(f"[alerts] load active-only failed: {r.status_code} {r.text[:80]}")
             return None
@@ -5433,8 +5243,6 @@ def _sb_load_active_only():
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
                 "expires_at":   row.get("expires_at"),
-                "supporters":   row.get("supporters") or [],
-                "nearby_refs":  row.get("nearby_refs") or [],
             })
         data = {"alerts": alerts, "archive": [], "telegram": tg,
                 "users": users, "errors": [], "last_update": now_teh()}
@@ -5598,32 +5406,6 @@ def check_alerts():
                         assignee_line = ""
                         created_at_raw = a.get("created_at", "")
                         created_label = f" | 📅 ثبت: <i>{created_at_raw[:16]}</i>" if created_at_raw else ""
-                        _sups = a.get("supporters") or []
-                        _sup_names = []
-                        for _su in _sups:
-                            if isinstance(_su, dict) and _su.get("name"):
-                                _sup_names.append(str(_su["name"]))
-                            elif isinstance(_su, str) and _su.strip():
-                                _sup_names.append(_su.strip())
-                        supporters_line = ""
-                        if _sup_names:
-                            supporters_line = "\n⭐ تأیید ناحیه توسط: <b>" + "، ".join(_hesc.escape(n, quote=False) for n in _sup_names) + "</b>"
-                        # 📍 اگه موقع ثبت، ناحیه‌ی نزدیک دیگه‌ای هم بود (و کاربر «ثبت جدید» زد)، اینجا نشون بده
-                        nearby_line = ""
-                        _nparts = []
-                        for _nr in (a.get("nearby_refs") or [])[:3]:
-                            if not (isinstance(_nr, dict) and _nr.get("by")):
-                                continue
-                            try:
-                                _nr_price = fmt_price(float(_nr.get("price", 0)), sym)
-                            except Exception:
-                                _nr_price = str(_nr.get("price", ""))
-                            _nparts.append(
-                                f"<b>{_hesc.escape(str(_nr['by']), quote=False)}</b> "
-                                f"(<code>{_nr_price}</code> — {_nr.get('distance_pips', '?')} پیپ {_nr.get('direction', '')})"
-                            )
-                        if _nparts:
-                            nearby_line = "\n📍 ناحیه‌ی نزدیک هم ثبت شده برای: " + "، ".join(_nparts)
                         fired_msg = (
                             f"🚨 <b>آلارم قیمت!</b>\n\n"
                             f"💰 <b>#{sym}</b> — {arrow}\n"
@@ -5634,8 +5416,6 @@ def check_alerts():
                             f"📏 فاصله: <b>{dist}</b>"
                             f"{cmt}"
                             f"{private_label}"
-                            f"{supporters_line}"
-                            f"{nearby_line}"
                             f"{assignee_line}\n\n⏰ {now_pretty()} (تهران){created_label}"
                         )
                         assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
@@ -5649,9 +5429,8 @@ def check_alerts():
                                 rows_kb.extend(_rating_keyboard(a["id"], _rate_state0))
                             return rows_kb
                         fired_msg_send = fired_msg
-                        _rate_deadline = time.time() + _rating_timeout_seconds(sym) if _is_team_alert else None
                         if _is_team_alert and _rate_state0 is not None:
-                            fired_msg_send = fired_msg + _build_rating_section(_rate_state0, _rate_deadline)
+                            fired_msg_send = fired_msg + _build_rating_section(_rate_state0)
                         fired_cid_to_mid = {}
                         if a.get("is_private") and a.get("notify_only"):
                             priv_cid = str(a["notify_only"])
@@ -5667,8 +5446,6 @@ def check_alerts():
                             fired_cid_to_mid["__tag__"] = alarm_num_tag
                             fired_cid_to_mid["__text__"] = fired_msg
                             fired_cid_to_mid["__creator__"] = _resolve_creator_name(creator)
-                            if _rate_deadline:
-                                fired_cid_to_mid["__rating_deadline__"] = _rate_deadline
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             print(f"[fire] saved msg map for {a['id']}: chats={list(fired_cid_to_mid.keys())}")
                             # همگام — تا قبل از اولین رای، map تو Supabase باشه (multi-instance)
@@ -5798,25 +5575,10 @@ def add_alert():
     sym = body.get("symbol","").upper().strip()
     atype = body.get("type","forex")
     tgt = float(body.get("target_price", 0))
-    condition = body.get("condition","above")
     creator = body.get("creator", "").strip()
     pin = body.get("pin", "").strip()
     if not _is_name_approved(creator, pin):
         return jsonify({"ok": False, "error": "این نام هنوز از طرف ادمین تایید نشده. لطفاً ابتدا از طریق ربات تلگرام (/start) درخواست فعال‌سازی بدید."}), 403
-
-    # موافقت با ناحیه موجود (ستاره) — فقط وب
-    support_id = str(body.get("support_alert_id") or "").strip()
-    if support_id:
-        updated = _add_supporter_to_alert(support_id, creator)
-        if not updated:
-            return jsonify({"ok": False, "error": "آلارم مورد نظر پیدا نشد یا غیرفعال/شخصی است."}), 404
-        return jsonify({
-            "ok": True,
-            "supported": True,
-            "alert": updated,
-            "message": f"⭐ تأیید شما روی ناحیه {updated.get('created_by')} ثبت شد."
-        })
-
     # آلارم شخصی فقط برای کسایی که از پنل ادمین/تلگرام دسترسیش رو گرفتن — وگرنه سایلنت عادی ثبت می‌شه
     is_private = False
     private_cid = None
@@ -5825,33 +5587,6 @@ def add_alert():
         if u_priv and (u_priv.get("private_access") or str(u_priv.get("chat_id", "")) == str(YOUR_CHAT_ID)):
             is_private = True
             private_cid = str(u_priv.get("chat_id", ""))
-
-    force_new = bool(body.get("force_new", False))
-    # چک نزدیکی — فقط تیمی، فقط وقتی force_new نیست
-    if not is_private and not force_new and tgt > 0:
-        nearby = _find_nearby_team_alerts(sym, tgt, condition, exclude_name=creator)
-        if nearby:
-            thr = nearby[0].get("threshold")
-            return jsonify({
-                "ok": False,
-                "needs_confirm": True,
-                "threshold_pips": thr,
-                "nearby": nearby,
-                "message": "نزدیک این قیمت، آلارم تیمی دیگری هست. جدید ثبت کنید یا همان ناحیه را تأیید (ستاره) کنید."
-            }), 409
-
-    # کاربر با وجود ناحیه‌ی نزدیک «ثبت جدید» زده — snapshot رو تو خود آلارم نگه می‌داریم تا موقع فایر نشون داده بشه
-    nearby_refs = []
-    if not is_private and force_new and tgt > 0:
-        for n in _find_nearby_team_alerts(sym, tgt, condition, exclude_name=creator)[:3]:
-            nearby_refs.append({
-                "id": n.get("id"),
-                "by": n.get("created_by"),
-                "price": n.get("target_price"),
-                "distance_pips": n.get("distance_pips"),
-                "direction": n.get("direction"),
-            })
-
     cur = get_price(sym, atype) if (atype!="forex" or is_forex_market_open()) else None
     expire_days = body.get("expire_days")
     expires_at = None
@@ -5863,18 +5598,18 @@ def add_alert():
         expires_at = (datetime.now(TEHRAN) + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S")
     a = {
         "id": str(int(time.time() * 1000)), "symbol": sym, "type": atype,
-        "target_price": tgt, "condition": condition,
+        "target_price": tgt, "condition": body.get("condition","above"),
         "comment": body.get("comment","").strip(), "active": True,
         "created_by": creator or "ناشناس",
         "is_private": is_private,
         "private_cid": private_cid,
         "notify_only": private_cid,
         "expires_at": expires_at,
-        "supporters": [],
-        "nearby_refs": nearby_refs,
         "last_price": cur, "last_checked": now_teh() if cur else None,
         "created_at": now_teh()
     }
+    # قفل: خوندن، اضافه‌کردن، و ذخیره باید یه عملیات atomic باشه —
+    # وگرنه اگه check_alerts هم‌زمان کش رو رفرش کنه، یکی از تغییرات گم می‌شه
     with _alerts_cache_lock:
         data = load_alerts()
         data["alerts"].append(a)
@@ -6657,69 +6392,27 @@ def _add_gold_bot_subscriber(chat_id: str):
     return True
 
 def _broadcast_to_gold_bot(text: str):
-    """(قدیمی) همه‌ی مشترکین ربات دوم — الان برای سیگنال نهایی از _send_final_signal استفاده می‌شه"""
-    _send_final_signal(text)
-
-def _send_final_signal(text: str) -> int:
-    """متن رو به همه‌ی مشترکین ربات «سیگنال نهایی» می‌فرسته؛ تعداد ارسال موفق رو برمی‌گردونه"""
-    if not FINAL_BOT_TOKEN:
-        return 0
+    """این پیام رو مستقل از mute بودن ربات اصلی، به همه‌ی مشترکین ربات طلا می‌فرسته"""
+    if not GOLD_BOT_TOKEN:
+        return
     with _gold_bot_lock:
         subs = list(_gold_bot_subscribers)
-    ok = 0
     for cid in subs:
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{FINAL_BOT_TOKEN}/sendMessage",
-                json={"chat_id": str(cid), "text": text, "parse_mode": "HTML"},
-                timeout=10, headers=H)
-            if r.status_code == 200:
-                ok += 1
-            else:
-                print(f"[finalbot] send {cid}: {r.status_code} {r.text[:100]}")
+            send_tg(GOLD_BOT_TOKEN, cid, text)
         except Exception as e:
-            print(f"[finalbot] send error to {cid}: {e}")
-    return ok
-
-def _build_final_signal_text(alert_id: str, state: dict, creator_name: str) -> str:
-    mm = _fired_msg_ids.get(alert_id, {}) or {}
-    head = "🟢 <b>سیگنال نهایی — Setup A</b>" if state.get("label") == "setup_a" else "🔵 <b>سیگنال نهایی — Setup B</b>"
-    base = (mm.get("__text__") or mm.get("__tag__") or str(alert_id))
-    lines = [head, "", base, "", "────────────",
-             f"⭐ مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}"]
-    if state.get("timed_out"):
-        lines.append("⏱ مهلت رأی‌گیری تموم شد — رأی‌ندادن‌ها ۰ ثبت شد")
-    lines.append("")
-    for v in state.get("votes", []):
-        why = _hesc.escape((v.get("reason") or "").strip(), quote=False)
-        nm = _hesc.escape(str(v.get("voter_name", "—")), quote=False)
-        lines.append(f"• {nm}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
-    lines += ["", f"👤 سازنده: {_hesc.escape(str(creator_name or '—'), quote=False)}"]
-    text = "\n".join(lines)
-    if len(text) > 3900:  # سقف طول پیام تلگرام — فقط تگ آلارم + نتیجه
-        text = "\n".join([head, "", str(mm.get("__tag__") or alert_id), "",
-                          f"⭐ مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}"])
-    return text
-
-def _final_bot_allowed_cids() -> set:
-    """فقط اعضای تیم / چت‌های تاییدشده‌ی ربات اصلی می‌تونن مشترک بشن — که سیگنال‌ها دست غریبه نیفته"""
-    allowed = set(str(x) for x in TEAM_MEMBER_IDS.values() if x)
-    try:
-        allowed |= set(str(x) for x in _get_token_and_cids()[1])
-    except Exception:
-        pass
-    return allowed
+            print(f"[goldbot] send error to {cid}: {e}")
 
 def poll_gold_bot():
-    """حلقه‌ی polling ربات «سیگنال نهایی» — فقط /start رو مدیریت می‌کنه"""
-    if not FINAL_BOT_TOKEN:
-        print("[finalbot] FINAL_BOT_TOKEN/GOLD_BOT_TOKEN تنظیم نشده — این ربات غیرفعاله")
+    """حلقه‌ی polling ساده‌ی ربات طلا — فقط /start رو مدیریت می‌کنه"""
+    if not GOLD_BOT_TOKEN:
+        print("[goldbot] GOLD_BOT_TOKEN تنظیم نشده — این ربات غیرفعاله")
         return
     last_id = 0
     while True:
         try:
             r = requests.get(
-                f"https://api.telegram.org/bot{FINAL_BOT_TOKEN}/getUpdates",
+                f"https://api.telegram.org/bot{GOLD_BOT_TOKEN}/getUpdates",
                 params={"offset": last_id + 1, "timeout": 20, "limit": 100},
                 timeout=30, headers=H)
             if r.status_code != 200:
@@ -6733,15 +6426,12 @@ def poll_gold_bot():
                 if cid is None:
                     continue
                 if text == "/start":
-                    if str(cid) not in _final_bot_allowed_cids():
-                        send_tg(FINAL_BOT_TOKEN, cid, "⛔ دسترسی نداری. اول تو ربات اصلی تیم عضو شو، بعد دوباره /start بزن.")
-                        continue
                     is_new = _add_gold_bot_subscriber(cid)
-                    welcome = ("📡 <b>سیگنال نهایی</b>\n\n"
-                               "از این به بعد نتیجه‌ی نهایی ستاپ‌های <b>A</b> و <b>B</b> (بعد از رأی‌گیری تیم) اینجا برات میاد.")
-                    send_tg(FINAL_BOT_TOKEN, cid, welcome if is_new else "✅ از قبل مشترک بودی، همچنان فعاله.")
+                    welcome = ("🟡 <b>ربات آلارم طلا</b>\n\n"
+                               "از این به بعد هر آلارم طلا (فوری و معمولی) اینجا برات میاد.")
+                    send_tg(GOLD_BOT_TOKEN, cid, welcome if is_new else "✅ از قبل مشترک بودی، همچنان فعاله.")
         except Exception as e:
-            print(f"[finalbot] poll error: {e}")
+            print(f"[goldbot] poll error: {e}")
         time.sleep(5)
 
 
@@ -6757,7 +6447,7 @@ def _delete_webhook_if_any(token):
 
 _main_tok, _, _ = _get_token_and_cids()
 _delete_webhook_if_any(_main_tok)
-_delete_webhook_if_any(FINAL_BOT_TOKEN)
+_delete_webhook_if_any(GOLD_BOT_TOKEN)
 
 threading.Thread(target=poll_telegram, daemon=True).start()
 threading.Thread(target=poll_gold_bot, daemon=True).start()
@@ -6765,8 +6455,6 @@ print("[STARTUP] thread poll_telegram شروع شد")
 
 # ── بازیابی fired_msgs و counters از Supabase بعد از restart ──
 _sb_load_fired_msgs()
-threading.Thread(target=_rating_timeout_loop, daemon=True).start()
-print("[STARTUP] thread rating_timeout_loop شروع شد")
 _sb_load_sym_counters()
 # بازسازی کامل state از Supabase بعد از هر restart
 _sb_restore_on_startup()
