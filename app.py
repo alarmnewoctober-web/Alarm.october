@@ -1154,8 +1154,13 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
     body += ["", f"👤 سازنده: {creator_name or '—'}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
     # Setup A / B → تو ربات اصلی ریپلای و نمایش داده نمی‌شه؛ فقط با ربات طلا می‌ره
-    if state.get("label") in ("setup_a", "setup_b") and _send_result_to_gold_bot(text):
-        return
+    if state.get("label") in ("setup_a", "setup_b"):
+        # برای ربات طلا کل اطلاعات آلارم (نماد، تگ، سازنده، قیمت، کامنت، زمان) + نتیجه‌ی نظرسنجی
+        _mm_g = _fired_msg_ids.get(alert_id) or _load_fired_msg_map(alert_id) or {}
+        _alarm_txt = _strip_rating_section(_mm_g.get("__text__", "") or "")
+        _gold_text = (_alarm_txt + "\n\n────────────\n" + text) if _alarm_txt else text
+        if _send_result_to_gold_bot(_gold_text):
+            return
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
