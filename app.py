@@ -1066,6 +1066,24 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         print(f"[rating] save map exc: {e}")
     return state
 
+def _send_result_to_gold_bot(text: str) -> bool:
+    """نتیجه‌ی Setup A/B رو با GOLD_BOT_TOKEN برای مشترک‌های ربات طلا (+ علی) می‌فرسته.
+    اگه توکن/گیرنده‌ای نبود False برمی‌گردونه تا نتیجه گم نشه و روال قبلی (ربات اصلی) اجرا بشه."""
+    if not GOLD_BOT_TOKEN:
+        return False
+    with _gold_bot_lock:
+        targets = set(str(x) for x in _gold_bot_subscribers)
+    if RATING_RESULT_NOTIFY_CID:
+        targets.add(str(RATING_RESULT_NOTIFY_CID))
+    if not targets:
+        return False
+    for cid in sorted(targets):
+        try:
+            send_tg(GOLD_BOT_TOKEN, cid, text)
+        except Exception as e:
+            print(f"[rating] gold bot send error to {cid}: {e}")
+    return True
+
 def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: str):
     tag = (_fired_msg_ids.get(alert_id) or {}).get("__tag__", alert_id)
     body = [
@@ -1077,6 +1095,9 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
         body.append(f"• {v.get('voter_name','—')}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
     body += ["", f"👤 سازنده: {creator_name or '—'}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
+    # Setup A / B → تو ربات اصلی ریپلای و نمایش داده نمی‌شه؛ فقط با ربات طلا می‌ره
+    if state.get("label") in ("setup_a", "setup_b") and _send_result_to_gold_bot(text):
+        return
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
