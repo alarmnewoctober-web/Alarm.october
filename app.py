@@ -2476,7 +2476,44 @@ def _do_update(upd, token):
                         if rs_aid:
                             threading.Thread(target=_rate_try_notify, args=(token_cbq, rs_aid, rs_creator), daemon=True).start()
 
-                    elif cbq_data.startswith("rate_close:"):
+                    elif cbq_data.startswith("rate_close:") or cbq_data.startswith("rate_close_no:"):
+                        # مرحله‌ی تایید: فقط کیبوردِ همین پیام عوض می‌شه (برای بقیه‌ی اعضا چیزی تغییر نمی‌کنه)
+                        rq_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
+                        rq_clicker = str(cbq.get("from", {}).get("id", ""))
+                        rq_ask = cbq_data.startswith("rate_close:")
+                        if not rq_aid:
+                            answer_callback(token_cbq, cbq_id, "نامعتبر")
+                        elif rq_clicker not in TEAM_ID_TO_NAME:
+                            answer_callback(token_cbq, cbq_id, "فقط اعضای تیم می‌تونن ببندن")
+                        else:
+                            mm_rq = _load_fired_msg_map(rq_aid)
+                            creator_rq = _resolve_creator_name(mm_rq.get("__creator__", ""))
+                            st_rq = _compute_rating_state(_sb_load_ratings(rq_aid), creator_rq)
+                            if mm_rq.get("__rating_cancelled__") == "1":
+                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
+                            elif mm_rq.get("__rating_closed__") == "1":
+                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
+                            elif rq_ask and st_rq["voters_count"] == 0:
+                                answer_callback(token_cbq, cbq_id, "هنوز هیچ رایی ثبت نشده")
+                            else:
+                                if rq_ask:
+                                    answer_callback(token_cbq, cbq_id, "⚠️ مطمئنی؟ با رای‌های فعلی بسته و محاسبه می‌شه")
+                                    kb_rq = [[
+                                        {"text": "✅ بله، ببند و محاسبه کن", "callback_data": f"rate_close_yes:{rq_aid}"},
+                                        {"text": "↩️ انصراف", "callback_data": f"rate_close_no:{rq_aid}"},
+                                    ]]
+                                else:
+                                    answer_callback(token_cbq, cbq_id, "انصراف داده شد")
+                                    kb_rq = _rating_keyboard(rq_aid, st_rq)
+                                try:
+                                    requests.post(f"https://api.telegram.org/bot{token_cbq}/editMessageReplyMarkup",
+                                                  json={"chat_id": str(cbq_cid), "message_id": cbq_msg_id,
+                                                        "reply_markup": {"inline_keyboard": kb_rq}},
+                                                  timeout=10, headers=H)
+                                except Exception as e:
+                                    print(f"[rating] close confirm kb exc: {e}")
+
+                    elif cbq_data.startswith("rate_close_yes:"):
                         rc_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
                         rc_clicker = str(cbq.get("from", {}).get("id", ""))
                         if not rc_aid:
