@@ -878,7 +878,7 @@ def _resolve_creator_name(name: str, cid=None) -> str:
         print(f"[rating] resolve creator exc: {e}")
     return n
 
-def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = False) -> dict:
+def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = False, force_kind: str = "manual") -> dict:
     eligible = _eligible_raters(creator_name)
     max_voters = max(1, len(eligible))
     # همه رای‌های ذخیره‌شده نشون داده می‌شن (حتی اگه اسم دقیقاً تو TEAM_MEMBERS نبود)
@@ -912,15 +912,19 @@ def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = F
     if force_closed and not closed:
         # بستن دستی: با رأی‌های موجود محاسبه کن (همون آستانه‌های ۱۵ / ۱۰ روی مجموع فعلی)
         manual, closed = True, True
-        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
+        if n == 0:
+            label = "no_votes"
+        else:
+            label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
     label_fa = {
         "pending": "⏳ در حال جمع‌آوری رای",
         "setup_a": "🟢 Setup A",
         "setup_b": "🔵 Setup B",
         "risky": "🔴 پرریسک",
+        "no_votes": "⏱ بسته شد — رایی ثبت نشد",
     }.get(label, label)
-    if manual:
-        label_fa += " · 🔒 بسته‌شده دستی"
+    if manual and label != "no_votes":
+        label_fa += " · ⏱ بسته‌شده خودکار" if force_kind == "auto" else " · 🔒 بسته‌شده دستی"
     return {
         "manual": manual,
         "total": total, "voters_count": n, "max_voters": max_voters,
@@ -929,10 +933,10 @@ def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = F
         "max_possible": max_possible, "min_possible": min_possible,
     }
 
-def _build_rating_section(state: dict) -> str:
+def _build_rating_section(state: dict, cancelled: bool = False) -> str:
     lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>"]
     lines.append(f"مجموع: <b>{state['total']}</b>  ·  {state['voters_count']}/{state['max_voters']} رای")
-    lines.append(state["label_fa"])
+    lines.append("❌ <b>لغو شد</b> (آلارم false شد)" if cancelled else state["label_fa"])
     if state["votes"]:
         lines.append("")
         for v in state["votes"]:
@@ -940,7 +944,7 @@ def _build_rating_section(state: dict) -> str:
             sc = v.get("score", "?")
             nm = v.get("voter_name", "—")
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
-    if not state["closed"]:
+    if not state["closed"] and not cancelled:
         lines.append("")
         lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
     return "\n".join(lines)
@@ -1007,8 +1011,9 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     msg_map = _load_fired_msg_map(alert_id)
     if msg_map.get("__rating_cancelled__") == "1":
         return state  # آلارم false شده — پیام نباید دوباره به حالت رأی‌گیری برگرده
-    if msg_map.get("__rating_manual__") == "1":
-        state = _compute_rating_state(votes, creator_name, force_closed=True)
+    if msg_map.get("__rating_manual__") in ("1", "auto"):
+        state = _compute_rating_state(votes, creator_name, force_closed=True,
+                                      force_kind=("auto" if msg_map.get("__rating_manual__") == "auto" else "manual"))
     if extra_chat_msg:
         ec, em = extra_chat_msg
         if ec and em:
@@ -1065,6 +1070,59 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     except Exception as e:
         print(f"[rating] save map exc: {e}")
     return state
+
+RATE_AUTO_CLOSE_GOLD = 15 * 60      # طلا (معمولی و فوری)
+RATE_AUTO_CLOSE_INSTANT = 15 * 60   # فوریِ بقیه‌ی نمادها
+RATE_AUTO_CLOSE_REGULAR = 60 * 60   # معمولیِ بقیه‌ی نمادها
+
+def _rate_auto_close_seconds(sym: str, instant: bool) -> int:
+    su = (sym or "").upper()
+    if "XAU" in su or "GOLD" in su:
+        return RATE_AUTO_CLOSE_GOLD
+    return RATE_AUTO_CLOSE_INSTANT if instant else RATE_AUTO_CLOSE_REGULAR
+
+def _rate_auto_close(alert_id: str):
+    """زمان رأی‌گیری تموم شد → با رأی‌های موجود بسته و محاسبه می‌شه؛ بدون رای فقط بسته می‌شه (نتیجه‌ای نمی‌ره)."""
+    try:
+        with _rating_lock_for(alert_id):
+            mm = _load_fired_msg_map(alert_id)
+            if mm.get("__rating_cancelled__") == "1" or mm.get("__rating_closed__") == "1":
+                return
+            creator = _resolve_creator_name(mm.get("__creator__", ""))
+            mm["__rating_closed__"] = "1"
+            mm["__rating_manual__"] = "auto"
+            _fired_msg_ids[alert_id] = mm
+            try:
+                _sb_save_fired_msgs(alert_id, mm)
+            except Exception as e:
+                print(f"[rating] auto close save exc: {e}")
+        token = _get_token_and_cids()[0]
+        _refresh_rating_messages(token, alert_id, creator)
+        _rate_try_notify(token, alert_id, creator)
+        print(f"[rating] auto closed {alert_id}")
+    except Exception as e:
+        print(f"[rating] auto close exc: {e}")
+
+def _rating_autoclose_loop():
+    """هر ۲۰ ثانیه آلارم‌های باز رو چک می‌کنه؛ deadline تو map (Supabase) ذخیره‌ست، پس بعد از ری‌استارت هم کار می‌کنه."""
+    while True:
+        try:
+            now = time.time()
+            for aid, mm in list(_fired_msg_ids.items()):
+                if not isinstance(mm, dict):
+                    continue
+                dl = mm.get("__rating_deadline__")
+                if not dl or mm.get("__rating_closed__") == "1" or mm.get("__rating_cancelled__") == "1":
+                    continue
+                try:
+                    due = now >= float(dl)
+                except (TypeError, ValueError):
+                    continue
+                if due:
+                    _rate_auto_close(aid)
+        except Exception as e:
+            print(f"[rating] autoclose loop exc: {e}")
+        time.sleep(20)
 
 def _send_result_to_gold_bot(text: str) -> bool:
     """نتیجه‌ی Setup A/B رو با GOLD_BOT_TOKEN برای مشترک‌های ربات طلا (+ علی) می‌فرسته.
@@ -1142,7 +1200,9 @@ def _rate_cancel_poll(alert_id: str):
         base = _strip_rating_section(msg_map.get("__text__", "") or msg_map.get("__text_rated__", ""))
         if not base:
             return
-        new_text = base + "\n\n────────────\n⭐ <b>نظرسنجی</b>: ❌ لغو شد (آلارم false شد)"
+        creator_cx = _resolve_creator_name(msg_map.get("__creator__", ""))
+        state_cx = _compute_rating_state(_sb_load_ratings(alert_id), creator_cx, force_closed=True)
+        new_text = base + _build_rating_section(state_cx, cancelled=True)  # رأی‌های ثبت‌شده تا اینجا می‌مونن
         for tc, tm in list(msg_map.items()):
             if str(tc).startswith("__"):
                 continue
@@ -1167,9 +1227,10 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
             return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
         creator_name = _resolve_creator_name(creator_name or _mm.get("__creator__", ""))
         state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name,
-                                      force_closed=(_mm.get("__rating_manual__") == "1"))
-        if not state["closed"]:
-            return
+                                      force_closed=(_mm.get("__rating_manual__") in ("1", "auto")),
+                                      force_kind=("auto" if _mm.get("__rating_manual__") == "auto" else "manual"))
+        if not state["closed"] or state["voters_count"] == 0:
+            return  # بسته نشده، یا هیچ رایی نیست → نتیجه‌ای برای فرستادن نیست
         with _rating_result_notified_lock:
             if alert_id in _rating_result_notified:
                 return
@@ -1193,6 +1254,7 @@ def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
         cid_to_mid["__tag__"] = atag
         cid_to_mid["__text__"] = msg
         cid_to_mid["__creator__"] = creator
+        cid_to_mid["__rating_deadline__"] = str(int(time.time() + _rate_auto_close_seconds(_extract_symbol_from_tag(atag), True)))
         _fired_msg_ids[aid] = cid_to_mid
         try:
             _sb_save_fired_msgs(aid, cid_to_mid)
@@ -5504,6 +5566,8 @@ def check_alerts():
                             fired_cid_to_mid["__tag__"] = alarm_num_tag
                             fired_cid_to_mid["__text__"] = fired_msg
                             fired_cid_to_mid["__creator__"] = _resolve_creator_name(creator)
+                            if _is_team_alert:
+                                fired_cid_to_mid["__rating_deadline__"] = str(int(time.time() + _rate_auto_close_seconds(sym, False)))
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             print(f"[fire] saved msg map for {a['id']}: chats={list(fired_cid_to_mid.keys())}")
                             # همگام — تا قبل از اولین رای، map تو Supabase باشه (multi-instance)
@@ -6513,6 +6577,7 @@ print("[STARTUP] thread poll_telegram شروع شد")
 
 # ── بازیابی fired_msgs و counters از Supabase بعد از restart ──
 _sb_load_fired_msgs()
+threading.Thread(target=_rating_autoclose_loop, daemon=True).start()
 _sb_load_sym_counters()
 # بازسازی کامل state از Supabase بعد از هر restart
 _sb_restore_on_startup()
