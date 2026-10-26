@@ -943,7 +943,7 @@ def _build_rating_section(state: dict, cancelled: bool = False) -> str:
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"] and not cancelled:
         lines.append("")
-        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
+        lines.append("<i>روی دکمه ۰ تا ۵ بزن</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
@@ -952,6 +952,7 @@ def _rating_keyboard(alert_id: str, state: dict) -> list:
     aid = str(alert_id)
     # تلگرام رنگ واقعی دکمه نداره — با ایموجی طیف قرمز→سبز
     return [[
+        {"text": "❌ 0", "callback_data": f"rate:{aid}:0"},
         {"text": "🔴 1", "callback_data": f"rate:{aid}:1"},
         {"text": "🟠 2", "callback_data": f"rate:{aid}:2"},
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
@@ -2495,11 +2496,11 @@ def _do_update(upd, token):
                         parts_rt = cbq_data.split(":")
                         rt_aid = parts_rt[1] if len(parts_rt) > 1 else ""
                         try:
-                            rt_score = int(parts_rt[2]) if len(parts_rt) > 2 else 0
+                            rt_score = int(parts_rt[2]) if len(parts_rt) > 2 else -1
                         except ValueError:
-                            rt_score = 0
+                            rt_score = -1
                         print(f"[rating] click aid={rt_aid} score={rt_score} cid={cbq_cid}")
-                        if not rt_aid or rt_score not in (1, 2, 3, 4, 5):
+                        if not rt_aid or rt_score not in (0, 1, 2, 3, 4, 5):
                             answer_callback(token_cbq, cbq_id, "امتیاز نامعتبر")
                         else:
                             clicker_id_rt = str(cbq.get("from", {}).get("id", ""))
