@@ -898,24 +898,21 @@ def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = F
     remaining = max(0, max_voters - n)
     max_possible = total + remaining * 5
     min_possible = total + remaining * 1
+    def _tier(t):
+        # آستانه‌ها روی مجموع: <10 پرریسک | ≥10 B | ≥15 A (به ۱۵ برسه همون لحظه بسته می‌شه)
+        return "setup_a" if t >= 15 else ("setup_b" if t >= 10 else "risky")
     label, closed = "pending", False
     if remaining == 0:
-        closed = True
-        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
-    elif max_possible < 10:
-        closed, label = True, "risky"
-    elif min_possible >= 15:
-        closed, label = True, "setup_a"
-    elif min_possible >= 10 and max_possible < 15:
-        closed, label = True, "setup_b"
+        closed, label = True, _tier(total)
+    elif _tier(total) == _tier(max_possible):
+        # مجموع فقط می‌تونه بالا بره؛ اگه حتی با ۵ی کامل از بقیه هم سطح عوض نمی‌شه، همین الان قطعیه
+        # (برچسب همیشه با مجموعِ نمایش‌داده‌شده می‌خونه)
+        closed, label = True, _tier(total)
     manual = False
     if force_closed and not closed:
-        # بستن دستی: با رأی‌های موجود محاسبه کن (همون آستانه‌های ۱۵ / ۱۰ روی مجموع فعلی)
+        # بستن دستی/خودکار: با رأی‌های موجود و همین آستانه‌ها روی مجموع فعلی محاسبه کن
         manual, closed = True, True
-        if n == 0:
-            label = "no_votes"
-        else:
-            label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
+        label = "no_votes" if n == 0 else _tier(total)
     label_fa = {
         "pending": "⏳ در حال جمع‌آوری رای",
         "setup_a": "🟢 Setup A",
@@ -1162,6 +1159,32 @@ def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: 
         if _send_result_to_gold_bot(_gold_text):
             return
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
+    if state.get("label") == "risky":
+        # فقط هشتک آلارم + «ستاپ پرریسک تشخیص داده شد»؛ ۵ دقیقه بعد پاک می‌شه تا ربات خلوت بمونه
+        short = f"{tag}\nستاپ پرریسک تشخیص داده شد\n\nاین پیام ۵ دقیقه دیگه پاک می‌شه"
+        sent_to = set()
+        for tc, tm in list(msg_map.items()):
+            if str(tc).startswith("__"):
+                continue
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": tc, "text": short, "parse_mode": "HTML", "reply_to_message_id": int(tm)},
+                    timeout=8, headers=H)
+                mid_r = (r.json().get("result") or {}).get("message_id")
+                if mid_r:
+                    _delete_msg_after(token, tc, mid_r, delay=300)
+                sent_to.add(str(tc))
+            except Exception as e:
+                print(f"[rating] risky notify fail {tc}: {e}")
+        if RATING_RESULT_NOTIFY_CID and str(RATING_RESULT_NOTIFY_CID) not in sent_to:
+            try:
+                mid_a = send_tg_keyboard(token, str(RATING_RESULT_NOTIFY_CID), short, [], track=False)
+                if mid_a:
+                    _delete_msg_after(token, str(RATING_RESULT_NOTIFY_CID), mid_a, delay=300)
+            except Exception as e:
+                print(f"[rating] risky ali notify: {e}")
+        return
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
             continue
@@ -1225,8 +1248,6 @@ def _rate_cancel_poll(alert_id: str):
 def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
     """نتیجه‌ی نهایی رو فقط وقتی بفرست که رأی‌گیری بسته شده و دیگه کسی در حال نوشتن دلیل نیست (فقط یک‌بار)"""
     try:
-        if _rate_has_open_reasons(alert_id):
-            return
         _mm = _load_fired_msg_map(alert_id)
         if _mm.get("__rating_cancelled__") == "1":
             return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
@@ -1236,6 +1257,8 @@ def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
                                       force_kind=("auto" if _mm.get("__rating_manual__") == "auto" else "manual"))
         if not state["closed"] or state["voters_count"] == 0:
             return  # بسته نشده، یا هیچ رایی نیست → نتیجه‌ای برای فرستادن نیست
+        if state["label"] != "risky" and _rate_has_open_reasons(alert_id):
+            return  # A/B منتظر دلیل آخرین رأی‌دهنده می‌مونن؛ پرریسک فوری می‌ره
         with _rating_result_notified_lock:
             if alert_id in _rating_result_notified:
                 return
@@ -2553,7 +2576,7 @@ def _do_update(upd, token):
 
                     elif cbq_data.startswith("rate_skip:"):
                         rs_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        answer_callback(token_cbq, cbq_id)
+                        answer_callback(token_cbq, cbq_id, "رد شد")
                         rs_creator = ""
                         _rs_pr = _pending_rate.get(cbq_cid)
                         if isinstance(_rs_pr, dict) and _rs_pr.get("alert_id") == rs_aid:
@@ -4794,7 +4817,8 @@ def _do_update(upd, token):
                             _refresh_rating_messages(token, rt_aid, creator_rt)
                             if pr.get("prompt_mid"):
                                 _delete_msg_after(token, cid, pr["prompt_mid"], delay=0)
-                            send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
+                            if user_msg_id:
+                                _delete_msg_after(token, cid, user_msg_id, delay=0)  # متن کامنت کاربر هم پاک می‌شه (دلیل تو پیام نظرسنجی دیده می‌شه)
                             threading.Thread(target=_rate_try_notify, args=(token, rt_aid, creator_rt), daemon=True).start()
                         else:
                             _pending_rate[cid] = pr  # دوباره فرصت بده
