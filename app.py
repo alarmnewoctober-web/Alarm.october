@@ -943,7 +943,7 @@ def _build_rating_section(state: dict, cancelled: bool = False) -> str:
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"] and not cancelled:
         lines.append("")
-        lines.append("<i>روی دکمه ۰ تا ۵ بزن — برای تغییر رای، دوباره بزن</i>")
+        lines.append("<i>روی دکمه ۰ تا ۵ بزن (بعد از رای، با «ویرایش» می‌تونی عوضش کنی)</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
@@ -959,10 +959,35 @@ def _rating_keyboard(alert_id: str, state: dict) -> list:
         {"text": "🟢 4", "callback_data": f"rate:{aid}:4"},
         {"text": "💚 5", "callback_data": f"rate:{aid}:5"},
     ], [
-        {"text": "✏️ ویرایش کامنت من", "callback_data": f"rate_edit:{aid}"},
-    ], [
         {"text": "🔒 بستن دستی و محاسبه", "callback_data": f"rate_close:{aid}"},
     ]]
+
+_rate_editing = set()  # {(alert_id, chat_id)} — کسایی که الان تو حالت ویرایشِ رای/کامنت‌ان
+
+def _rating_keyboard_for(alert_id: str, state: dict, cid) -> list:
+    """کیبورد اختصاصی هر چت: کسی که رای داده فقط دکمه‌ی «ویرایش» می‌بینه (تا اتفاقی رایش عوض نشه)،
+    با زدنش دکمه‌های امتیاز + «فقط کامنت» + «انصراف» دوباره باز می‌شن."""
+    if state.get("closed"):
+        return []
+    aid, cid = str(alert_id), str(cid)
+    voted = any(str(v.get("voter_cid")) == cid for v in state.get("votes", []))
+    if voted and (aid, cid) not in _rate_editing:
+        return [[{"text": "✏️ ویرایش رای و کامنت", "callback_data": f"rate_edit:{aid}"}]]
+    kb = _rating_keyboard(aid, state)
+    if voted:
+        kb.insert(1, [
+            {"text": "✏️ فقط کامنت", "callback_data": f"rate_comment:{aid}"},
+            {"text": "↩️ انصراف", "callback_data": f"rate_edit_cancel:{aid}"},
+        ])
+    return kb
+
+def _edit_markup(token: str, chat_id, mid, kb: list):
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                      json={"chat_id": str(chat_id), "message_id": mid, "reply_markup": {"inline_keyboard": kb}},
+                      timeout=10, headers=H)
+    except Exception as e:
+        print(f"[rating] edit markup exc: {e}")
 
 def _load_fired_msg_map(alert_id: str) -> dict:
     """map پیام فایر رو از حافظه + Supabase یکی کن (برای multi-instance حیاتی است)"""
@@ -1031,7 +1056,6 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         return state
     base = _strip_rating_section(base)
     full_text = base + _build_rating_section(state)
-    kb = _rating_keyboard(alert_id, state)
     targets = [(k, v) for k, v in msg_map.items() if not str(k).startswith("__")]
     print(f"[rating] will edit {len(targets)} chats: {[t[0] for t in targets]}")
     edited = 0
@@ -1039,7 +1063,8 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         try:
             mid = int(tm)
             payload = {"chat_id": str(tc), "message_id": mid, "text": full_text,
-                       "parse_mode": "HTML", "reply_markup": {"inline_keyboard": kb}}
+                       "parse_mode": "HTML",
+                       "reply_markup": {"inline_keyboard": _rating_keyboard_for(alert_id, state, tc)}}
             r = requests.post(
                 f"https://api.telegram.org/bot{token}/editMessageText",
                 json=payload, timeout=10, headers=H)
@@ -2535,7 +2560,7 @@ def _do_update(upd, token):
                                 else:
                                     existing_votes = _sb_load_ratings(rt_aid)
                                     my_prev = next((v for v in existing_votes if _norm_name(v.get("voter_name","")) == _norm_name(voter_name_rt) or str(v.get("voter_cid")) == clicker_id_rt), None)
-                                    if my_prev is not None and int(my_prev.get("score") or 0) == rt_score:
+                                    if my_prev is not None and int(my_prev.get("score") or 0) == rt_score and (rt_aid, clicker_id_rt) not in _rate_editing:
                                         answer_callback(token_cbq, cbq_id, "همین رای رو قبلاً دادی")
                                     else:
                                         st_chk = _compute_rating_state(existing_votes, creator_rt)
@@ -2547,6 +2572,7 @@ def _do_update(upd, token):
                                                 answer_callback(token_cbq, cbq_id, "❌ ثبت نشد، دوباره بزن")
                                             else:
                                                 answer_callback(token_cbq, cbq_id, ("رای به %s تغییر کرد" if my_prev else "امتیاز %s ثبت شد") % rt_score)
+                                                _rate_editing.discard((rt_aid, clicker_id_rt))
                                                 _extra = (cbq_cid, cbq_msg_id)
                                                 _fb_text = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
                                                 print(f"[rating] before refresh map_keys={list((_fired_msg_ids.get(rt_aid) or {}).keys())} fb_len={len(_fb_text)}")
@@ -2581,8 +2607,34 @@ def _do_update(upd, token):
                                                     _tm_rt.daemon = True
                                                     _tm_rt.start()
 
-                    elif cbq_data.startswith("rate_edit:"):
-                        # ویرایش کامنت: فقط کسی که رای داده و تا وقتی رای‌گیری بازه
+                    elif cbq_data.startswith("rate_edit:") or cbq_data.startswith("rate_edit_cancel:"):
+                        # ورود به حالت ویرایش (دکمه‌های امتیاز دوباره باز می‌شن) / انصراف از ویرایش
+                        ed_cancel = cbq_data.startswith("rate_edit_cancel:")
+                        ed_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
+                        ed_clicker = str(cbq.get("from", {}).get("id", ""))
+                        if not ed_aid:
+                            answer_callback(token_cbq, cbq_id, "نامعتبر")
+                        else:
+                            mm_ed = _load_fired_msg_map(ed_aid)
+                            votes_ed = _sb_load_ratings(ed_aid)
+                            st_ed = _compute_rating_state(votes_ed, _resolve_creator_name(mm_ed.get("__creator__", "")))
+                            if mm_ed.get("__rating_cancelled__") == "1":
+                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
+                            elif mm_ed.get("__rating_closed__") == "1":
+                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
+                            elif ed_cancel:
+                                _rate_editing.discard((ed_aid, ed_clicker))
+                                answer_callback(token_cbq, cbq_id, "انصراف داده شد")
+                                _edit_markup(token_cbq, cbq_cid, cbq_msg_id, _rating_keyboard_for(ed_aid, st_ed, cbq_cid))
+                            elif not any(str(v.get("voter_cid")) == ed_clicker for v in votes_ed):
+                                answer_callback(token_cbq, cbq_id, "اول باید رای بدی")
+                            else:
+                                _rate_editing.add((ed_aid, ed_clicker))
+                                answer_callback(token_cbq, cbq_id, "✏️ رای یا کامنت جدیدت رو بزن")
+                                _edit_markup(token_cbq, cbq_cid, cbq_msg_id, _rating_keyboard_for(ed_aid, st_ed, cbq_cid))
+
+                    elif cbq_data.startswith("rate_comment:"):
+                        # ویرایش فقط کامنت: فقط کسی که رای داده و تا وقتی رای‌گیری بازه
                         re_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
                         re_clicker = str(cbq.get("from", {}).get("id", ""))
                         re_name = TEAM_ID_TO_NAME.get(re_clicker) or _get_user_custom_name(re_clicker) or _get_user_custom_name(cbq_cid) or ("user_" + re_clicker)
@@ -2595,7 +2647,8 @@ def _do_update(upd, token):
                             elif mm_re.get("__rating_closed__") == "1":
                                 answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                             else:
-                                mine_re = next((v for v in _sb_load_ratings(re_aid) if _norm_name(v.get("voter_name", "")) == _norm_name(re_name) or str(v.get("voter_cid")) == re_clicker), None)
+                                votes_re = _sb_load_ratings(re_aid)
+                                mine_re = next((v for v in votes_re if _norm_name(v.get("voter_name", "")) == _norm_name(re_name) or str(v.get("voter_cid")) == re_clicker), None)
                                 if mine_re is None:
                                     answer_callback(token_cbq, cbq_id, "اول باید رای بدی")
                                 else:
@@ -2617,6 +2670,9 @@ def _do_update(upd, token):
                                         "already_saved": True, "ts": time.time(), "prompt_mid": mid_re, "closer": False,
                                     }
                                     _pending_rate[cbq_cid] = _pending_rate[re_clicker]
+                                    _rate_editing.discard((re_aid, re_clicker))
+                                    _edit_markup(token_cbq, cbq_cid, cbq_msg_id,
+                                                 _rating_keyboard_for(re_aid, _compute_rating_state(votes_re, _resolve_creator_name(mm_re.get("__creator__", ""))), cbq_cid))
 
                     elif cbq_data.startswith("rate_skip:"):
                         rs_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
@@ -2659,7 +2715,7 @@ def _do_update(upd, token):
                                     ]]
                                 else:
                                     answer_callback(token_cbq, cbq_id, "انصراف داده شد")
-                                    kb_rq = _rating_keyboard(rq_aid, st_rq)
+                                    kb_rq = _rating_keyboard_for(rq_aid, st_rq, cbq_cid)
                                 try:
                                     requests.post(f"https://api.telegram.org/bot{token_cbq}/editMessageReplyMarkup",
                                                   json={"chat_id": str(cbq_cid), "message_id": cbq_msg_id,
