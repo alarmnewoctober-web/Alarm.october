@@ -943,7 +943,7 @@ def _build_rating_section(state: dict, cancelled: bool = False) -> str:
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
     if not state["closed"] and not cancelled:
         lines.append("")
-        lines.append("<i>روی دکمه ۰ تا ۵ بزن</i>")
+        lines.append("<i>روی دکمه ۰ تا ۵ بزن — برای تغییر رای، دوباره بزن</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
@@ -958,6 +958,8 @@ def _rating_keyboard(alert_id: str, state: dict) -> list:
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
         {"text": "🟢 4", "callback_data": f"rate:{aid}:4"},
         {"text": "💚 5", "callback_data": f"rate:{aid}:5"},
+    ], [
+        {"text": "✏️ ویرایش کامنت من", "callback_data": f"rate_edit:{aid}"},
     ], [
         {"text": "🔒 بستن دستی و محاسبه", "callback_data": f"rate_close:{aid}"},
     ]]
@@ -2532,17 +2534,19 @@ def _do_update(upd, token):
                                     answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                                 else:
                                     existing_votes = _sb_load_ratings(rt_aid)
-                                    if any(_norm_name(v.get("voter_name","")) == _norm_name(voter_name_rt) or str(v.get("voter_cid")) == clicker_id_rt for v in existing_votes):
-                                        answer_callback(token_cbq, cbq_id, "قبلا رای دادی")
+                                    my_prev = next((v for v in existing_votes if _norm_name(v.get("voter_name","")) == _norm_name(voter_name_rt) or str(v.get("voter_cid")) == clicker_id_rt), None)
+                                    if my_prev is not None and int(my_prev.get("score") or 0) == rt_score:
+                                        answer_callback(token_cbq, cbq_id, "همین رای رو قبلاً دادی")
                                     else:
                                         st_chk = _compute_rating_state(existing_votes, creator_rt)
                                         if st_chk["closed"]:
                                             answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                                         else:
-                                            if not _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, "", creator_rt):
+                                            _prev_reason = ((my_prev.get("reason") or "") if my_prev else "")
+                                            if not _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, _prev_reason, creator_rt):
                                                 answer_callback(token_cbq, cbq_id, "❌ ثبت نشد، دوباره بزن")
                                             else:
-                                                answer_callback(token_cbq, cbq_id, "امتیاز %s ثبت شد" % rt_score)
+                                                answer_callback(token_cbq, cbq_id, ("رای به %s تغییر کرد" if my_prev else "امتیاز %s ثبت شد") % rt_score)
                                                 _extra = (cbq_cid, cbq_msg_id)
                                                 _fb_text = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
                                                 print(f"[rating] before refresh map_keys={list((_fired_msg_ids.get(rt_aid) or {}).keys())} fb_len={len(_fb_text)}")
@@ -2557,9 +2561,11 @@ def _do_update(upd, token):
                                                     if _old_pr.get("alert_id"):
                                                         threading.Thread(target=_rate_try_notify, args=(token_cbq, _old_pr["alert_id"], _old_pr.get("creator", "")), daemon=True).start()
                                                 # پرامپت دلیل (با دکمه رد کردن) — «ثبت شد» بعد از نوشتن دلیل میاد
+                                                _prompt_txt = "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score
+                                                if _prev_reason.strip():
+                                                    _prompt_txt += "\nکامنت فعلی: <i>%s</i>\n(رد کنی، همین می‌مونه)" % _prev_reason.strip()
                                                 _prompt_mid = send_tg_keyboard(
-                                                    token_cbq, cbq_cid,
-                                                    "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score,
+                                                    token_cbq, cbq_cid, _prompt_txt,
                                                     [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % rt_aid}]])
                                                 _pending_rate[clicker_id_rt] = {
                                                     "alert_id": rt_aid, "score": rt_score,
@@ -2574,6 +2580,43 @@ def _do_update(upd, token):
                                                     _tm_rt = threading.Timer(RATE_NOTIFY_WAIT + 3, _rate_try_notify, args=(token_cbq, rt_aid, creator_rt))
                                                     _tm_rt.daemon = True
                                                     _tm_rt.start()
+
+                    elif cbq_data.startswith("rate_edit:"):
+                        # ویرایش کامنت: فقط کسی که رای داده و تا وقتی رای‌گیری بازه
+                        re_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
+                        re_clicker = str(cbq.get("from", {}).get("id", ""))
+                        re_name = TEAM_ID_TO_NAME.get(re_clicker) or _get_user_custom_name(re_clicker) or _get_user_custom_name(cbq_cid) or ("user_" + re_clicker)
+                        if not re_aid:
+                            answer_callback(token_cbq, cbq_id, "نامعتبر")
+                        else:
+                            mm_re = _load_fired_msg_map(re_aid)
+                            if mm_re.get("__rating_cancelled__") == "1":
+                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
+                            elif mm_re.get("__rating_closed__") == "1":
+                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
+                            else:
+                                mine_re = next((v for v in _sb_load_ratings(re_aid) if _norm_name(v.get("voter_name", "")) == _norm_name(re_name) or str(v.get("voter_cid")) == re_clicker), None)
+                                if mine_re is None:
+                                    answer_callback(token_cbq, cbq_id, "اول باید رای بدی")
+                                else:
+                                    answer_callback(token_cbq, cbq_id, "✏️ کامنت جدیدت رو بنویس")
+                                    _old_re = _pending_rate.pop(re_clicker, None)
+                                    if isinstance(_old_re, dict) and _old_re.get("prompt_mid"):
+                                        _delete_msg_after(token_cbq, cbq_cid, _old_re["prompt_mid"], delay=0)
+                                    cur_re = (mine_re.get("reason") or "").strip()
+                                    txt_re = "✏️ <b>ویرایش کامنت</b> (رای فعلی: %s/5)" % int(mine_re.get("score") or 0)
+                                    if cur_re:
+                                        txt_re += "\nکامنت فعلی: <i>%s</i>" % cur_re
+                                    txt_re += "\n\nکامنت جدید رو بنویس («-» بفرستی کامنت پاک می‌شه)"
+                                    mid_re = send_tg_keyboard(token_cbq, cbq_cid, txt_re,
+                                                              [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % re_aid}]])
+                                    _pending_rate[re_clicker] = {
+                                        "alert_id": re_aid, "score": int(mine_re.get("score") or 0),
+                                        "voter_name": mine_re.get("voter_name") or re_name,
+                                        "creator": _resolve_creator_name(mm_re.get("__creator__", "")),
+                                        "already_saved": True, "ts": time.time(), "prompt_mid": mid_re, "closer": False,
+                                    }
+                                    _pending_rate[cbq_cid] = _pending_rate[re_clicker]
 
                     elif cbq_data.startswith("rate_skip:"):
                         rs_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
