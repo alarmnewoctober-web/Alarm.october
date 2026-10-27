@@ -43,6 +43,88 @@ def is_crypto_symbol(sym):
     crypto_list = ['BTC','ETH','SOL','BNB','XRP','ADA','DOGE','TRX','TON','AVAX','MATIC','DOT','LINK','UNI','ATOM','LTC','SHIB','OP','ARB','NEAR','FTM','SAND','MANA']
     return any(c in sym_up for c in crypto_list)
 
+def _nearby_pip_threshold(symbol: str) -> object:
+    """آستانه نزدیکی برای پیشنهاد ستاره — فقط وب. طلا ۵۰، جفت‌ارز ۳۰، کریپتو None (چک نمی‌شه)."""
+    sym_up = (symbol or "").upper()
+    if is_crypto_symbol(sym_up):
+        return None
+    if "XAU" in sym_up or "XAG" in sym_up:
+        return 50
+    return 30
+
+def _price_distance_pips(symbol: str, p1: float, p2: float) -> float:
+    try:
+        return abs(float(p1) - float(p2)) * get_pip_multiplier(symbol)
+    except Exception:
+        return 1e18
+
+def _find_nearby_team_alerts(symbol: str, target: float, condition: str, exclude_name: str = "") -> list:
+    """آلارم‌های تیمی فعال هم‌نماد هم‌جهت در فاصله آستانه."""
+    thr = _nearby_pip_threshold(symbol)
+    if thr is None:
+        return []
+    data = load_alerts()
+    out = []
+    excl = (exclude_name or "").strip().lower()
+    for a in data.get("alerts", []):
+        if not a.get("active"):
+            continue
+        if a.get("is_private"):
+            continue
+        if (a.get("symbol") or "").upper() != (symbol or "").upper():
+            continue
+        if (a.get("condition") or "above") != (condition or "above"):
+            continue
+        if excl and (a.get("created_by") or "").strip().lower() == excl:
+            continue
+        dist = _price_distance_pips(symbol, target, a.get("target_price") or 0)
+        if dist <= thr:
+            out.append({
+                "id": a.get("id"),
+                "symbol": a.get("symbol"),
+                "target_price": a.get("target_price"),
+                "condition": a.get("condition"),
+                "created_by": a.get("created_by") or "—",
+                "created_at": a.get("created_at") or "",
+                "distance_pips": round(dist, 1),
+                "direction": "بالاتر" if float(a.get("target_price") or 0) > float(target) else (
+                    "پایین‌تر" if float(a.get("target_price") or 0) < float(target) else "هم‌قیمت"
+                ),
+                "supporters": a.get("supporters") or [],
+                "threshold": thr,
+            })
+    out.sort(key=lambda x: x["distance_pips"])
+    return out[:5]
+
+def _add_supporter_to_alert(alert_id: str, supporter_name: str) -> object:
+    """ستاره/تأیید روی آلارم موجود — برمی‌گرداند آلارم آپدیت‌شده یا None"""
+    name = (supporter_name or "").strip()
+    if not name or not alert_id:
+        return None
+    with _alerts_cache_lock:
+        data = load_alerts()
+        target = None
+        for a in data.get("alerts", []):
+            if str(a.get("id")) == str(alert_id) and a.get("active") and not a.get("is_private"):
+                target = a
+                break
+        if not target:
+            return None
+        sups = list(target.get("supporters") or [])
+        if any((s.get("name") or "").strip().lower() == name.lower() for s in sups if isinstance(s, dict)):
+            return target  # قبلاً تأیید کرده
+        if (target.get("created_by") or "").strip().lower() == name.lower():
+            return target  # سازنده خودش
+        sups.append({"name": name, "at": now_teh()})
+        target["supporters"] = sups
+        save_alerts(data)
+    # persist
+    try:
+        _sb_upsert_alert(target)
+    except Exception as e:
+        print(f"[support] upsert exc: {e}")
+    return target
+
 def _empty_alerts():
     return {
         "alerts": [], "archive": [], "telegram": {"bot_token": "", "chat_ids": []},
@@ -93,6 +175,8 @@ def _sb_upsert_alert(a):
             payload["expires_at"] = a["expires_at"]
         if a.get("expired_at") is not None:
             payload["expired_at"] = a["expired_at"]
+        if a.get("supporters") is not None:
+            payload["supporters"] = a.get("supporters") or []
 
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/alerts",
@@ -337,6 +421,7 @@ def _sb_load_all_alerts():
                 "last_checked": row.get("last_checked"),
                 "fired_at":     row.get("fired_at"),
                 "fired_price":  row.get("fired_price"),
+                "supporters":   row.get("supporters") or [],
             }
             status = row.get("status","active")
             if status == "fired" or row.get("fired_at"):
@@ -878,7 +963,7 @@ def _resolve_creator_name(name: str, cid=None) -> str:
         print(f"[rating] resolve creator exc: {e}")
     return n
 
-def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = False, force_kind: str = "manual") -> dict:
+def _compute_rating_state(votes: list, creator_name: str) -> dict:
     eligible = _eligible_raters(creator_name)
     max_voters = max(1, len(eligible))
     # همه رای‌های ذخیره‌شده نشون داده می‌شن (حتی اگه اسم دقیقاً تو TEAM_MEMBERS نبود)
@@ -898,42 +983,33 @@ def _compute_rating_state(votes: list, creator_name: str, force_closed: bool = F
     remaining = max(0, max_voters - n)
     max_possible = total + remaining * 5
     min_possible = total + remaining * 1
-    def _tier(t):
-        # آستانه‌ها روی مجموع: <10 پرریسک | ≥10 B | ≥15 A (به ۱۵ برسه همون لحظه بسته می‌شه)
-        return "setup_a" if t >= 15 else ("setup_b" if t >= 10 else "risky")
     label, closed = "pending", False
     if remaining == 0:
-        closed, label = True, _tier(total)
-    elif _tier(total) == _tier(max_possible):
-        # مجموع فقط می‌تونه بالا بره؛ اگه حتی با ۵ی کامل از بقیه هم سطح عوض نمی‌شه، همین الان قطعیه
-        # (برچسب همیشه با مجموعِ نمایش‌داده‌شده می‌خونه)
-        closed, label = True, _tier(total)
-    manual = False
-    if force_closed and not closed:
-        # بستن دستی/خودکار: با رأی‌های موجود و همین آستانه‌ها روی مجموع فعلی محاسبه کن
-        manual, closed = True, True
-        label = "no_votes" if n == 0 else _tier(total)
+        closed = True
+        label = "setup_a" if total >= 15 else ("setup_b" if total >= 10 else "risky")
+    elif max_possible < 10:
+        closed, label = True, "risky"
+    elif min_possible >= 15:
+        closed, label = True, "setup_a"
+    elif min_possible >= 10 and max_possible < 15:
+        closed, label = True, "setup_b"
     label_fa = {
         "pending": "⏳ در حال جمع‌آوری رای",
         "setup_a": "🟢 Setup A",
         "setup_b": "🔵 Setup B",
         "risky": "🔴 پرریسک",
-        "no_votes": "⏱ بسته شد — رایی ثبت نشد",
     }.get(label, label)
-    if manual and label != "no_votes":
-        label_fa += " · ⏱ بسته‌شده خودکار" if force_kind == "auto" else " · 🔒 بسته‌شده دستی"
     return {
-        "manual": manual,
         "total": total, "voters_count": n, "max_voters": max_voters,
         "remaining": remaining, "closed": closed, "label": label,
         "label_fa": label_fa, "votes": clean,
         "max_possible": max_possible, "min_possible": min_possible,
     }
 
-def _build_rating_section(state: dict, cancelled: bool = False) -> str:
+def _build_rating_section(state: dict) -> str:
     lines = ["", "────────────", "⭐ <b>امتیازدهی تیم</b>"]
     lines.append(f"مجموع: <b>{state['total']}</b>  ·  {state['voters_count']}/{state['max_voters']} رای")
-    lines.append("❌ <b>لغو شد</b> (آلارم false شد)" if cancelled else state["label_fa"])
+    lines.append(state["label_fa"])
     if state["votes"]:
         lines.append("")
         for v in state["votes"]:
@@ -941,9 +1017,9 @@ def _build_rating_section(state: dict, cancelled: bool = False) -> str:
             sc = v.get("score", "?")
             nm = v.get("voter_name", "—")
             lines.append(f"• <b>{nm}</b>: {sc}/5" + (f" — <i>{why}</i>" if why else ""))
-    if not state["closed"] and not cancelled:
+    if not state["closed"]:
         lines.append("")
-        lines.append("<i>روی دکمه ۰ تا ۵ بزن (بعد از رای، با «ویرایش» می‌تونی عوضش کنی)</i>")
+        lines.append("<i>روی دکمه ۱ تا ۵ بزن</i>")
     return "\n".join(lines)
 
 def _rating_keyboard(alert_id: str, state: dict) -> list:
@@ -952,42 +1028,12 @@ def _rating_keyboard(alert_id: str, state: dict) -> list:
     aid = str(alert_id)
     # تلگرام رنگ واقعی دکمه نداره — با ایموجی طیف قرمز→سبز
     return [[
-        {"text": "❌ 0", "callback_data": f"rate:{aid}:0"},
         {"text": "🔴 1", "callback_data": f"rate:{aid}:1"},
         {"text": "🟠 2", "callback_data": f"rate:{aid}:2"},
         {"text": "🟡 3", "callback_data": f"rate:{aid}:3"},
         {"text": "🟢 4", "callback_data": f"rate:{aid}:4"},
         {"text": "💚 5", "callback_data": f"rate:{aid}:5"},
-    ], [
-        {"text": "🔒 بستن دستی و محاسبه", "callback_data": f"rate_close:{aid}"},
     ]]
-
-_rate_editing = set()  # {(alert_id, chat_id)} — کسایی که الان تو حالت ویرایشِ رای/کامنت‌ان
-
-def _rating_keyboard_for(alert_id: str, state: dict, cid) -> list:
-    """کیبورد اختصاصی هر چت: کسی که رای داده فقط دکمه‌ی «ویرایش» می‌بینه (تا اتفاقی رایش عوض نشه)،
-    با زدنش دکمه‌های امتیاز + «فقط کامنت» + «انصراف» دوباره باز می‌شن."""
-    if state.get("closed"):
-        return []
-    aid, cid = str(alert_id), str(cid)
-    voted = any(str(v.get("voter_cid")) == cid for v in state.get("votes", []))
-    if voted and (aid, cid) not in _rate_editing:
-        return [[{"text": "✏️ ویرایش رای و کامنت", "callback_data": f"rate_edit:{aid}"}]]
-    kb = _rating_keyboard(aid, state)
-    if voted:
-        kb.insert(1, [
-            {"text": "✏️ فقط کامنت", "callback_data": f"rate_comment:{aid}"},
-            {"text": "↩️ انصراف", "callback_data": f"rate_edit_cancel:{aid}"},
-        ])
-    return kb
-
-def _edit_markup(token: str, chat_id, mid, kb: list):
-    try:
-        requests.post(f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
-                      json={"chat_id": str(chat_id), "message_id": mid, "reply_markup": {"inline_keyboard": kb}},
-                      timeout=10, headers=H)
-    except Exception as e:
-        print(f"[rating] edit markup exc: {e}")
 
 def _load_fired_msg_map(alert_id: str) -> dict:
     """map پیام فایر رو از حافظه + Supabase یکی کن (برای multi-instance حیاتی است)"""
@@ -1036,9 +1082,6 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
     msg_map = _load_fired_msg_map(alert_id)
     if msg_map.get("__rating_cancelled__") == "1":
         return state  # آلارم false شده — پیام نباید دوباره به حالت رأی‌گیری برگرده
-    if msg_map.get("__rating_manual__") in ("1", "auto"):
-        state = _compute_rating_state(votes, creator_name, force_closed=True,
-                                      force_kind=("auto" if msg_map.get("__rating_manual__") == "auto" else "manual"))
     if extra_chat_msg:
         ec, em = extra_chat_msg
         if ec and em:
@@ -1056,6 +1099,7 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         return state
     base = _strip_rating_section(base)
     full_text = base + _build_rating_section(state)
+    kb = _rating_keyboard(alert_id, state)
     targets = [(k, v) for k, v in msg_map.items() if not str(k).startswith("__")]
     print(f"[rating] will edit {len(targets)} chats: {[t[0] for t in targets]}")
     edited = 0
@@ -1063,8 +1107,7 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         try:
             mid = int(tm)
             payload = {"chat_id": str(tc), "message_id": mid, "text": full_text,
-                       "parse_mode": "HTML",
-                       "reply_markup": {"inline_keyboard": _rating_keyboard_for(alert_id, state, tc)}}
+                       "parse_mode": "HTML", "reply_markup": {"inline_keyboard": kb}}
             r = requests.post(
                 f"https://api.telegram.org/bot{token}/editMessageText",
                 json=payload, timeout=10, headers=H)
@@ -1096,123 +1139,18 @@ def _refresh_rating_messages(token: str, alert_id: str, creator_name: str, extra
         print(f"[rating] save map exc: {e}")
     return state
 
-RATE_AUTO_CLOSE_GOLD = 15 * 60      # طلا (معمولی و فوری)
-RATE_AUTO_CLOSE_INSTANT = 15 * 60   # فوریِ بقیه‌ی نمادها
-RATE_AUTO_CLOSE_REGULAR = 60 * 60   # معمولیِ بقیه‌ی نمادها
-
-def _rate_auto_close_seconds(sym: str, instant: bool) -> int:
-    su = (sym or "").upper()
-    if "XAU" in su or "GOLD" in su:
-        return RATE_AUTO_CLOSE_GOLD
-    return RATE_AUTO_CLOSE_INSTANT if instant else RATE_AUTO_CLOSE_REGULAR
-
-def _rate_auto_close(alert_id: str):
-    """زمان رأی‌گیری تموم شد → با رأی‌های موجود بسته و محاسبه می‌شه؛ بدون رای فقط بسته می‌شه (نتیجه‌ای نمی‌ره)."""
-    try:
-        with _rating_lock_for(alert_id):
-            mm = _load_fired_msg_map(alert_id)
-            if mm.get("__rating_cancelled__") == "1" or mm.get("__rating_closed__") == "1":
-                return
-            creator = _resolve_creator_name(mm.get("__creator__", ""))
-            mm["__rating_closed__"] = "1"
-            mm["__rating_manual__"] = "auto"
-            _fired_msg_ids[alert_id] = mm
-            try:
-                _sb_save_fired_msgs(alert_id, mm)
-            except Exception as e:
-                print(f"[rating] auto close save exc: {e}")
-        token = _get_token_and_cids()[0]
-        _refresh_rating_messages(token, alert_id, creator)
-        _rate_try_notify(token, alert_id, creator)
-        print(f"[rating] auto closed {alert_id}")
-    except Exception as e:
-        print(f"[rating] auto close exc: {e}")
-
-def _rating_autoclose_loop():
-    """هر ۲۰ ثانیه آلارم‌های باز رو چک می‌کنه؛ deadline تو map (Supabase) ذخیره‌ست، پس بعد از ری‌استارت هم کار می‌کنه."""
-    while True:
-        try:
-            now = time.time()
-            for aid, mm in list(_fired_msg_ids.items()):
-                if not isinstance(mm, dict):
-                    continue
-                dl = mm.get("__rating_deadline__")
-                if not dl or mm.get("__rating_closed__") == "1" or mm.get("__rating_cancelled__") == "1":
-                    continue
-                try:
-                    due = now >= float(dl)
-                except (TypeError, ValueError):
-                    continue
-                if due:
-                    _rate_auto_close(aid)
-        except Exception as e:
-            print(f"[rating] autoclose loop exc: {e}")
-        time.sleep(20)
-
-def _send_result_to_gold_bot(text: str) -> bool:
-    """نتیجه‌ی Setup A/B رو با GOLD_BOT_TOKEN برای مشترک‌های ربات طلا (+ علی) می‌فرسته.
-    اگه توکن/گیرنده‌ای نبود False برمی‌گردونه تا نتیجه گم نشه و روال قبلی (ربات اصلی) اجرا بشه."""
-    if not GOLD_BOT_TOKEN:
-        return False
-    with _gold_bot_lock:
-        targets = set(str(x) for x in _gold_bot_subscribers)
-    if RATING_RESULT_NOTIFY_CID:
-        targets.add(str(RATING_RESULT_NOTIFY_CID))
-    if not targets:
-        return False
-    for cid in sorted(targets):
-        try:
-            send_tg(GOLD_BOT_TOKEN, cid, text)
-        except Exception as e:
-            print(f"[rating] gold bot send error to {cid}: {e}")
-    return True
-
 def _notify_rating_result(token: str, alert_id: str, state: dict, creator_name: str):
     tag = (_fired_msg_ids.get(alert_id) or {}).get("__tag__", alert_id)
     body = [
         "✅ <b>نتیجه امتیازدهی</b>", str(tag), state["label_fa"],
-        f"مجموع امتیاز: <b>{state['total']}</b> از {(state['voters_count'] if state.get('manual') else state['max_voters']) * 5}", "",
+        f"مجموع امتیاز: <b>{state['total']}</b> از {state['max_voters'] * 5}", "",
     ]
     for v in state["votes"]:
         why = (v.get("reason") or "").strip()
         body.append(f"• {v.get('voter_name','—')}: {v.get('score','?')}/5" + (f" — {why}" if why else ""))
     body += ["", f"👤 سازنده: {creator_name or '—'}", f"@{RATING_RESULT_NOTIFY_USERNAME}"]
     text = "\n".join(body)
-    # Setup A / B → تو ربات اصلی ریپلای و نمایش داده نمی‌شه؛ فقط با ربات طلا می‌ره
-    if state.get("label") in ("setup_a", "setup_b"):
-        # برای ربات طلا کل اطلاعات آلارم (نماد، تگ، سازنده، قیمت، کامنت، زمان) + نتیجه‌ی نظرسنجی
-        _mm_g = _fired_msg_ids.get(alert_id) or _load_fired_msg_map(alert_id) or {}
-        _alarm_txt = _strip_rating_section(_mm_g.get("__text__", "") or "")
-        _gold_text = (_alarm_txt + "\n\n────────────\n" + text) if _alarm_txt else text
-        if _send_result_to_gold_bot(_gold_text):
-            return
     msg_map = _fired_msg_ids.get(alert_id, {}) or {}
-    if state.get("label") == "risky":
-        # فقط هشتک آلارم + «ستاپ پرریسک تشخیص داده شد»؛ ۵ دقیقه بعد پاک می‌شه تا ربات خلوت بمونه
-        short = f"{tag}\nستاپ پرریسک تشخیص داده شد\n\nاین پیام ۵ دقیقه دیگه پاک می‌شه"
-        sent_to = set()
-        for tc, tm in list(msg_map.items()):
-            if str(tc).startswith("__"):
-                continue
-            try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": tc, "text": short, "parse_mode": "HTML", "reply_to_message_id": int(tm)},
-                    timeout=8, headers=H)
-                mid_r = (r.json().get("result") or {}).get("message_id")
-                if mid_r:
-                    _delete_msg_after(token, tc, mid_r, delay=300)
-                sent_to.add(str(tc))
-            except Exception as e:
-                print(f"[rating] risky notify fail {tc}: {e}")
-        if RATING_RESULT_NOTIFY_CID and str(RATING_RESULT_NOTIFY_CID) not in sent_to:
-            try:
-                mid_a = send_tg_keyboard(token, str(RATING_RESULT_NOTIFY_CID), short, [], track=False)
-                if mid_a:
-                    _delete_msg_after(token, str(RATING_RESULT_NOTIFY_CID), mid_a, delay=300)
-            except Exception as e:
-                print(f"[rating] risky ali notify: {e}")
-        return
     for tc, tm in list(msg_map.items()):
         if str(tc).startswith("__"):
             continue
@@ -1256,9 +1194,7 @@ def _rate_cancel_poll(alert_id: str):
         base = _strip_rating_section(msg_map.get("__text__", "") or msg_map.get("__text_rated__", ""))
         if not base:
             return
-        creator_cx = _resolve_creator_name(msg_map.get("__creator__", ""))
-        state_cx = _compute_rating_state(_sb_load_ratings(alert_id), creator_cx, force_closed=True)
-        new_text = base + _build_rating_section(state_cx, cancelled=True)  # رأی‌های ثبت‌شده تا اینجا می‌مونن
+        new_text = base + "\n\n────────────\n⭐ <b>نظرسنجی</b>: ❌ لغو شد (آلارم false شد)"
         for tc, tm in list(msg_map.items()):
             if str(tc).startswith("__"):
                 continue
@@ -1276,17 +1212,15 @@ def _rate_cancel_poll(alert_id: str):
 def _rate_try_notify(token: str, alert_id: str, creator_name: str = ""):
     """نتیجه‌ی نهایی رو فقط وقتی بفرست که رأی‌گیری بسته شده و دیگه کسی در حال نوشتن دلیل نیست (فقط یک‌بار)"""
     try:
+        if _rate_has_open_reasons(alert_id):
+            return
         _mm = _load_fired_msg_map(alert_id)
         if _mm.get("__rating_cancelled__") == "1":
             return  # آلارم false شده — نتیجه‌ای فرستاده نمی‌شه
         creator_name = _resolve_creator_name(creator_name or _mm.get("__creator__", ""))
-        state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name,
-                                      force_closed=(_mm.get("__rating_manual__") in ("1", "auto")),
-                                      force_kind=("auto" if _mm.get("__rating_manual__") == "auto" else "manual"))
-        if not state["closed"] or state["voters_count"] == 0:
-            return  # بسته نشده، یا هیچ رایی نیست → نتیجه‌ای برای فرستادن نیست
-        if state["label"] != "risky" and _rate_has_open_reasons(alert_id):
-            return  # A/B منتظر دلیل آخرین رأی‌دهنده می‌مونن؛ پرریسک فوری می‌ره
+        state = _compute_rating_state(_sb_load_ratings(alert_id), creator_name)
+        if not state["closed"]:
+            return
         with _rating_result_notified_lock:
             if alert_id in _rating_result_notified:
                 return
@@ -1310,7 +1244,6 @@ def _send_instant_rated(tok, tgts, msg, aid, atag, creator) -> dict:
         cid_to_mid["__tag__"] = atag
         cid_to_mid["__text__"] = msg
         cid_to_mid["__creator__"] = creator
-        cid_to_mid["__rating_deadline__"] = str(int(time.time() + _rate_auto_close_seconds(_extract_symbol_from_tag(atag), True)))
         _fired_msg_ids[aid] = cid_to_mid
         try:
             _sb_save_fired_msgs(aid, cid_to_mid)
@@ -2523,11 +2456,11 @@ def _do_update(upd, token):
                         parts_rt = cbq_data.split(":")
                         rt_aid = parts_rt[1] if len(parts_rt) > 1 else ""
                         try:
-                            rt_score = int(parts_rt[2]) if len(parts_rt) > 2 else -1
+                            rt_score = int(parts_rt[2]) if len(parts_rt) > 2 else 0
                         except ValueError:
-                            rt_score = -1
+                            rt_score = 0
                         print(f"[rating] click aid={rt_aid} score={rt_score} cid={cbq_cid}")
-                        if not rt_aid or rt_score not in (0, 1, 2, 3, 4, 5):
+                        if not rt_aid or rt_score not in (1, 2, 3, 4, 5):
                             answer_callback(token_cbq, cbq_id, "امتیاز نامعتبر")
                         else:
                             clicker_id_rt = str(cbq.get("from", {}).get("id", ""))
@@ -2559,20 +2492,17 @@ def _do_update(upd, token):
                                     answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                                 else:
                                     existing_votes = _sb_load_ratings(rt_aid)
-                                    my_prev = next((v for v in existing_votes if _norm_name(v.get("voter_name","")) == _norm_name(voter_name_rt) or str(v.get("voter_cid")) == clicker_id_rt), None)
-                                    if my_prev is not None and int(my_prev.get("score") or 0) == rt_score and (rt_aid, clicker_id_rt) not in _rate_editing:
-                                        answer_callback(token_cbq, cbq_id, "همین رای رو قبلاً دادی")
+                                    if any(_norm_name(v.get("voter_name","")) == _norm_name(voter_name_rt) or str(v.get("voter_cid")) == clicker_id_rt for v in existing_votes):
+                                        answer_callback(token_cbq, cbq_id, "قبلا رای دادی")
                                     else:
                                         st_chk = _compute_rating_state(existing_votes, creator_rt)
                                         if st_chk["closed"]:
                                             answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
                                         else:
-                                            _prev_reason = ((my_prev.get("reason") or "") if my_prev else "")
-                                            if not _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, _prev_reason, creator_rt):
+                                            if not _sb_save_rating(rt_aid, clicker_id_rt, voter_name_rt, rt_score, "", creator_rt):
                                                 answer_callback(token_cbq, cbq_id, "❌ ثبت نشد، دوباره بزن")
                                             else:
-                                                answer_callback(token_cbq, cbq_id, ("رای به %s تغییر کرد" if my_prev else "امتیاز %s ثبت شد") % rt_score)
-                                                _rate_editing.discard((rt_aid, clicker_id_rt))
+                                                answer_callback(token_cbq, cbq_id, "امتیاز %s ثبت شد" % rt_score)
                                                 _extra = (cbq_cid, cbq_msg_id)
                                                 _fb_text = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
                                                 print(f"[rating] before refresh map_keys={list((_fired_msg_ids.get(rt_aid) or {}).keys())} fb_len={len(_fb_text)}")
@@ -2587,11 +2517,9 @@ def _do_update(upd, token):
                                                     if _old_pr.get("alert_id"):
                                                         threading.Thread(target=_rate_try_notify, args=(token_cbq, _old_pr["alert_id"], _old_pr.get("creator", "")), daemon=True).start()
                                                 # پرامپت دلیل (با دکمه رد کردن) — «ثبت شد» بعد از نوشتن دلیل میاد
-                                                _prompt_txt = "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score
-                                                if _prev_reason.strip():
-                                                    _prompt_txt += "\nکامنت فعلی: <i>%s</i>\n(رد کنی، همین می‌مونه)" % _prev_reason.strip()
                                                 _prompt_mid = send_tg_keyboard(
-                                                    token_cbq, cbq_cid, _prompt_txt,
+                                                    token_cbq, cbq_cid,
+                                                    "📝 <b>دلیل امتیاز %s/5</b> رو بنویس (اختیاری)" % rt_score,
                                                     [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % rt_aid}]])
                                                 _pending_rate[clicker_id_rt] = {
                                                     "alert_id": rt_aid, "score": rt_score,
@@ -2607,76 +2535,9 @@ def _do_update(upd, token):
                                                     _tm_rt.daemon = True
                                                     _tm_rt.start()
 
-                    elif cbq_data.startswith("rate_edit:") or cbq_data.startswith("rate_edit_cancel:"):
-                        # ورود به حالت ویرایش (دکمه‌های امتیاز دوباره باز می‌شن) / انصراف از ویرایش
-                        ed_cancel = cbq_data.startswith("rate_edit_cancel:")
-                        ed_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        ed_clicker = str(cbq.get("from", {}).get("id", ""))
-                        if not ed_aid:
-                            answer_callback(token_cbq, cbq_id, "نامعتبر")
-                        else:
-                            mm_ed = _load_fired_msg_map(ed_aid)
-                            votes_ed = _sb_load_ratings(ed_aid)
-                            st_ed = _compute_rating_state(votes_ed, _resolve_creator_name(mm_ed.get("__creator__", "")))
-                            if mm_ed.get("__rating_cancelled__") == "1":
-                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
-                            elif mm_ed.get("__rating_closed__") == "1":
-                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
-                            elif ed_cancel:
-                                _rate_editing.discard((ed_aid, ed_clicker))
-                                answer_callback(token_cbq, cbq_id, "انصراف داده شد")
-                                _edit_markup(token_cbq, cbq_cid, cbq_msg_id, _rating_keyboard_for(ed_aid, st_ed, cbq_cid))
-                            elif not any(str(v.get("voter_cid")) == ed_clicker for v in votes_ed):
-                                answer_callback(token_cbq, cbq_id, "اول باید رای بدی")
-                            else:
-                                _rate_editing.add((ed_aid, ed_clicker))
-                                answer_callback(token_cbq, cbq_id, "✏️ رای یا کامنت جدیدت رو بزن")
-                                _edit_markup(token_cbq, cbq_cid, cbq_msg_id, _rating_keyboard_for(ed_aid, st_ed, cbq_cid))
-
-                    elif cbq_data.startswith("rate_comment:"):
-                        # ویرایش فقط کامنت: فقط کسی که رای داده و تا وقتی رای‌گیری بازه
-                        re_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        re_clicker = str(cbq.get("from", {}).get("id", ""))
-                        re_name = TEAM_ID_TO_NAME.get(re_clicker) or _get_user_custom_name(re_clicker) or _get_user_custom_name(cbq_cid) or ("user_" + re_clicker)
-                        if not re_aid:
-                            answer_callback(token_cbq, cbq_id, "نامعتبر")
-                        else:
-                            mm_re = _load_fired_msg_map(re_aid)
-                            if mm_re.get("__rating_cancelled__") == "1":
-                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
-                            elif mm_re.get("__rating_closed__") == "1":
-                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
-                            else:
-                                votes_re = _sb_load_ratings(re_aid)
-                                mine_re = next((v for v in votes_re if _norm_name(v.get("voter_name", "")) == _norm_name(re_name) or str(v.get("voter_cid")) == re_clicker), None)
-                                if mine_re is None:
-                                    answer_callback(token_cbq, cbq_id, "اول باید رای بدی")
-                                else:
-                                    answer_callback(token_cbq, cbq_id, "✏️ کامنت جدیدت رو بنویس")
-                                    _old_re = _pending_rate.pop(re_clicker, None)
-                                    if isinstance(_old_re, dict) and _old_re.get("prompt_mid"):
-                                        _delete_msg_after(token_cbq, cbq_cid, _old_re["prompt_mid"], delay=0)
-                                    cur_re = (mine_re.get("reason") or "").strip()
-                                    txt_re = "✏️ <b>ویرایش کامنت</b> (رای فعلی: %s/5)" % int(mine_re.get("score") or 0)
-                                    if cur_re:
-                                        txt_re += "\nکامنت فعلی: <i>%s</i>" % cur_re
-                                    txt_re += "\n\nکامنت جدید رو بنویس («-» بفرستی کامنت پاک می‌شه)"
-                                    mid_re = send_tg_keyboard(token_cbq, cbq_cid, txt_re,
-                                                              [[{"text": "⏭ رد کردن", "callback_data": "rate_skip:%s" % re_aid}]])
-                                    _pending_rate[re_clicker] = {
-                                        "alert_id": re_aid, "score": int(mine_re.get("score") or 0),
-                                        "voter_name": mine_re.get("voter_name") or re_name,
-                                        "creator": _resolve_creator_name(mm_re.get("__creator__", "")),
-                                        "already_saved": True, "ts": time.time(), "prompt_mid": mid_re, "closer": False,
-                                    }
-                                    _pending_rate[cbq_cid] = _pending_rate[re_clicker]
-                                    _rate_editing.discard((re_aid, re_clicker))
-                                    _edit_markup(token_cbq, cbq_cid, cbq_msg_id,
-                                                 _rating_keyboard_for(re_aid, _compute_rating_state(votes_re, _resolve_creator_name(mm_re.get("__creator__", ""))), cbq_cid))
-
                     elif cbq_data.startswith("rate_skip:"):
                         rs_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        answer_callback(token_cbq, cbq_id, "رد شد")
+                        answer_callback(token_cbq, cbq_id)
                         rs_creator = ""
                         _rs_pr = _pending_rate.get(cbq_cid)
                         if isinstance(_rs_pr, dict) and _rs_pr.get("alert_id") == rs_aid:
@@ -2686,74 +2547,6 @@ def _do_update(upd, token):
                             _delete_msg_after(token_cbq, cbq_cid, cbq_msg_id, delay=0)
                         if rs_aid:
                             threading.Thread(target=_rate_try_notify, args=(token_cbq, rs_aid, rs_creator), daemon=True).start()
-
-                    elif cbq_data.startswith("rate_close:") or cbq_data.startswith("rate_close_no:"):
-                        # مرحله‌ی تایید: فقط کیبوردِ همین پیام عوض می‌شه (برای بقیه‌ی اعضا چیزی تغییر نمی‌کنه)
-                        rq_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        rq_clicker = str(cbq.get("from", {}).get("id", ""))
-                        rq_ask = cbq_data.startswith("rate_close:")
-                        if not rq_aid:
-                            answer_callback(token_cbq, cbq_id, "نامعتبر")
-                        elif rq_clicker not in TEAM_ID_TO_NAME:
-                            answer_callback(token_cbq, cbq_id, "فقط اعضای تیم می‌تونن ببندن")
-                        else:
-                            mm_rq = _load_fired_msg_map(rq_aid)
-                            creator_rq = _resolve_creator_name(mm_rq.get("__creator__", ""))
-                            st_rq = _compute_rating_state(_sb_load_ratings(rq_aid), creator_rq)
-                            if mm_rq.get("__rating_cancelled__") == "1":
-                                answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
-                            elif mm_rq.get("__rating_closed__") == "1":
-                                answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
-                            elif rq_ask and st_rq["voters_count"] == 0:
-                                answer_callback(token_cbq, cbq_id, "هنوز هیچ رایی ثبت نشده")
-                            else:
-                                if rq_ask:
-                                    answer_callback(token_cbq, cbq_id, "⚠️ مطمئنی؟ با رای‌های فعلی بسته و محاسبه می‌شه")
-                                    kb_rq = [[
-                                        {"text": "✅ بله، ببند و محاسبه کن", "callback_data": f"rate_close_yes:{rq_aid}"},
-                                        {"text": "↩️ انصراف", "callback_data": f"rate_close_no:{rq_aid}"},
-                                    ]]
-                                else:
-                                    answer_callback(token_cbq, cbq_id, "انصراف داده شد")
-                                    kb_rq = _rating_keyboard_for(rq_aid, st_rq, cbq_cid)
-                                try:
-                                    requests.post(f"https://api.telegram.org/bot{token_cbq}/editMessageReplyMarkup",
-                                                  json={"chat_id": str(cbq_cid), "message_id": cbq_msg_id,
-                                                        "reply_markup": {"inline_keyboard": kb_rq}},
-                                                  timeout=10, headers=H)
-                                except Exception as e:
-                                    print(f"[rating] close confirm kb exc: {e}")
-
-                    elif cbq_data.startswith("rate_close_yes:"):
-                        rc_aid = cbq_data.split(":", 1)[1] if ":" in cbq_data else ""
-                        rc_clicker = str(cbq.get("from", {}).get("id", ""))
-                        if not rc_aid:
-                            answer_callback(token_cbq, cbq_id, "نامعتبر")
-                        elif rc_clicker not in TEAM_ID_TO_NAME:
-                            answer_callback(token_cbq, cbq_id, "فقط اعضای تیم می‌تونن ببندن")
-                        else:
-                            with _rating_lock_for(rc_aid):
-                                mm_rc = _load_fired_msg_map(rc_aid)
-                                creator_rc = _resolve_creator_name(mm_rc.get("__creator__", ""))
-                                if mm_rc.get("__rating_cancelled__") == "1":
-                                    answer_callback(token_cbq, cbq_id, "آلارم false شده — رأی‌گیری لغو شد")
-                                elif mm_rc.get("__rating_closed__") == "1":
-                                    answer_callback(token_cbq, cbq_id, "رای‌گیری تموم شده")
-                                elif _compute_rating_state(_sb_load_ratings(rc_aid), creator_rc)["voters_count"] == 0:
-                                    answer_callback(token_cbq, cbq_id, "هنوز هیچ رایی ثبت نشده")
-                                else:
-                                    mm_rc["__rating_closed__"] = "1"
-                                    mm_rc["__rating_manual__"] = "1"
-                                    _fired_msg_ids[rc_aid] = mm_rc
-                                    try:
-                                        _sb_save_fired_msgs(rc_aid, mm_rc)
-                                    except Exception as e:
-                                        print(f"[rating] manual close save exc: {e}")
-                                    answer_callback(token_cbq, cbq_id, "🔒 رای‌گیری بسته شد")
-                                    _fb_rc = (cbq.get("message") or {}).get("text") or (cbq.get("message") or {}).get("caption") or ""
-                                    _refresh_rating_messages(token_cbq, rc_aid, creator_rc,
-                                                             extra_chat_msg=(cbq_cid, cbq_msg_id), fallback_text=_fb_rc)
-                                    threading.Thread(target=_rate_try_notify, args=(token_cbq, rc_aid, creator_rc), daemon=True).start()
 
                     elif cbq_data.startswith("del_confirm:"):
                         # مرحله اول: نمایش تأیید حذف
@@ -4917,8 +4710,7 @@ def _do_update(upd, token):
                             _refresh_rating_messages(token, rt_aid, creator_rt)
                             if pr.get("prompt_mid"):
                                 _delete_msg_after(token, cid, pr["prompt_mid"], delay=0)
-                            if user_msg_id:
-                                _delete_msg_after(token, cid, user_msg_id, delay=0)  # متن کامنت کاربر هم پاک می‌شه (دلیل تو پیام نظرسنجی دیده می‌شه)
+                            send_tg(token, cid, "✅ دلیل ثبت شد" + ((": " + reason_rt) if reason_rt else ""))
                             threading.Thread(target=_rate_try_notify, args=(token, rt_aid, creator_rt), daemon=True).start()
                         else:
                             _pending_rate[cid] = pr  # دوباره فرصت بده
@@ -5655,6 +5447,16 @@ def check_alerts():
                         assignee_line = ""
                         created_at_raw = a.get("created_at", "")
                         created_label = f" | 📅 ثبت: <i>{created_at_raw[:16]}</i>" if created_at_raw else ""
+                        _sups = a.get("supporters") or []
+                        _sup_names = []
+                        for _su in _sups:
+                            if isinstance(_su, dict) and _su.get("name"):
+                                _sup_names.append(str(_su["name"]))
+                            elif isinstance(_su, str) and _su.strip():
+                                _sup_names.append(_su.strip())
+                        supporters_line = ""
+                        if _sup_names:
+                            supporters_line = "\n⭐ تأیید ناحیه توسط: <b>" + "، ".join(_sup_names) + "</b>"
                         fired_msg = (
                             f"🚨 <b>آلارم قیمت!</b>\n\n"
                             f"💰 <b>#{sym}</b> — {arrow}\n"
@@ -5665,6 +5467,7 @@ def check_alerts():
                             f"📏 فاصله: <b>{dist}</b>"
                             f"{cmt}"
                             f"{private_label}"
+                            f"{supporters_line}"
                             f"{assignee_line}\n\n⏰ {now_pretty()} (تهران){created_label}"
                         )
                         assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
@@ -5695,8 +5498,6 @@ def check_alerts():
                             fired_cid_to_mid["__tag__"] = alarm_num_tag
                             fired_cid_to_mid["__text__"] = fired_msg
                             fired_cid_to_mid["__creator__"] = _resolve_creator_name(creator)
-                            if _is_team_alert:
-                                fired_cid_to_mid["__rating_deadline__"] = str(int(time.time() + _rate_auto_close_seconds(sym, False)))
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             print(f"[fire] saved msg map for {a['id']}: chats={list(fired_cid_to_mid.keys())}")
                             # همگام — تا قبل از اولین رای، map تو Supabase باشه (multi-instance)
@@ -5826,10 +5627,25 @@ def add_alert():
     sym = body.get("symbol","").upper().strip()
     atype = body.get("type","forex")
     tgt = float(body.get("target_price", 0))
+    condition = body.get("condition","above")
     creator = body.get("creator", "").strip()
     pin = body.get("pin", "").strip()
     if not _is_name_approved(creator, pin):
         return jsonify({"ok": False, "error": "این نام هنوز از طرف ادمین تایید نشده. لطفاً ابتدا از طریق ربات تلگرام (/start) درخواست فعال‌سازی بدید."}), 403
+
+    # موافقت با ناحیه موجود (ستاره) — فقط وب
+    support_id = str(body.get("support_alert_id") or "").strip()
+    if support_id:
+        updated = _add_supporter_to_alert(support_id, creator)
+        if not updated:
+            return jsonify({"ok": False, "error": "آلارم مورد نظر پیدا نشد یا غیرفعال/شخصی است."}), 404
+        return jsonify({
+            "ok": True,
+            "supported": True,
+            "alert": updated,
+            "message": f"⭐ تأیید شما روی ناحیه {updated.get('created_by')} ثبت شد."
+        })
+
     # آلارم شخصی فقط برای کسایی که از پنل ادمین/تلگرام دسترسیش رو گرفتن — وگرنه سایلنت عادی ثبت می‌شه
     is_private = False
     private_cid = None
@@ -5838,6 +5654,21 @@ def add_alert():
         if u_priv and (u_priv.get("private_access") or str(u_priv.get("chat_id", "")) == str(YOUR_CHAT_ID)):
             is_private = True
             private_cid = str(u_priv.get("chat_id", ""))
+
+    force_new = bool(body.get("force_new", False))
+    # چک نزدیکی — فقط تیمی، فقط وقتی force_new نیست
+    if not is_private and not force_new and tgt > 0:
+        nearby = _find_nearby_team_alerts(sym, tgt, condition, exclude_name=creator)
+        if nearby:
+            thr = nearby[0].get("threshold")
+            return jsonify({
+                "ok": False,
+                "needs_confirm": True,
+                "threshold_pips": thr,
+                "nearby": nearby,
+                "message": "نزدیک این قیمت، آلارم تیمی دیگری هست. جدید ثبت کنید یا همان ناحیه را تأیید (ستاره) کنید."
+            }), 409
+
     cur = get_price(sym, atype) if (atype!="forex" or is_forex_market_open()) else None
     expire_days = body.get("expire_days")
     expires_at = None
@@ -5849,18 +5680,17 @@ def add_alert():
         expires_at = (datetime.now(TEHRAN) + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S")
     a = {
         "id": str(int(time.time() * 1000)), "symbol": sym, "type": atype,
-        "target_price": tgt, "condition": body.get("condition","above"),
+        "target_price": tgt, "condition": condition,
         "comment": body.get("comment","").strip(), "active": True,
         "created_by": creator or "ناشناس",
         "is_private": is_private,
         "private_cid": private_cid,
         "notify_only": private_cid,
         "expires_at": expires_at,
+        "supporters": [],
         "last_price": cur, "last_checked": now_teh() if cur else None,
         "created_at": now_teh()
     }
-    # قفل: خوندن، اضافه‌کردن، و ذخیره باید یه عملیات atomic باشه —
-    # وگرنه اگه check_alerts هم‌زمان کش رو رفرش کنه، یکی از تغییرات گم می‌شه
     with _alerts_cache_lock:
         data = load_alerts()
         data["alerts"].append(a)
@@ -6706,7 +6536,6 @@ print("[STARTUP] thread poll_telegram شروع شد")
 
 # ── بازیابی fired_msgs و counters از Supabase بعد از restart ──
 _sb_load_fired_msgs()
-threading.Thread(target=_rating_autoclose_loop, daemon=True).start()
 _sb_load_sym_counters()
 # بازسازی کامل state از Supabase بعد از هر restart
 _sb_restore_on_startup()
