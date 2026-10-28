@@ -5536,9 +5536,17 @@ def _sb_load_active_only():
     """
     if not SUPABASE_KEY: return None
     try:
+        _cols_base = "id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users"
+        # supporters (ستاره ناحیه) باید توی select باشه وگرنه با هر refresh کش پاک می‌شه
         r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select=id,status,active,symbol,type,condition,target_price,created_by,created_at,comment,is_private,private_cid,notify_only,last_price,last_checked,fired_at,fired_price,expires_at,telegram_token,chat_ids,users&limit=500",
+            f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_cols_base},supporters&limit=500",
             headers=_sb_h(), timeout=10)
+        if r.status_code == 400 and "supporters" in r.text:
+            # ستون supporters هنوز توی جدول نیست — بدونش لود کن تا حلقه‌ی چک قیمت نخوابه
+            print("[alerts] ⚠️ ستون supporters توی جدول alerts نیست — ستاره‌ها بعد از refresh حفظ نمی‌شن")
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/alerts?or=(id.eq.__config__,status.eq.active)&select={_cols_base}&limit=500",
+                headers=_sb_h(), timeout=10)
         if r.status_code != 200:
             print(f"[alerts] load active-only failed: {r.status_code} {r.text[:80]}")
             return None
