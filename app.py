@@ -7801,17 +7801,102 @@ def report_weekly_html():
 </body></html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
+# ═══════════════════════════════════════════════════════════════════
+# 📥 خروجی اکسل آلارم‌ها — بر اساس سیستم جدید (بدون مسئول/تقسیم)
+# منبع اصلی: جدول alerts + رأی‌ها (alarm_ratings) + متن پیام ربات (fired_msgs)
+# ═══════════════════════════════════════════════════════════════════
+_EXP_G_INFO  = "اطلاعات آلارم"
+_EXP_G_TIME  = "زمان"
+_EXP_G_RATE  = "امتیاز و ستاپ"
+_EXP_G_MEMB  = "امتیاز و کامنت هر عضو"
+_EXP_G_FALSE = "False (داده‌ی قدیمی)"
+_EXP_G_BOT   = "پیام ربات"
+_EXP_G_MAN   = "ستون‌های خالی برای پر کردن دستی"
+
+def _export_column_defs():
+    """(key, عنوان, عرض, گروه, پیش‌فرض تیک‌خورده) — هم صفحه‌ی دانلود و هم خروجی از همین لیست می‌خونن"""
+    cols = [
+        ("alert_id",       "شناسه آلارم",        16, _EXP_G_INFO, False),
+        ("symbol",         "نماد",               10, _EXP_G_INFO, True),
+        ("direction",      "جهت",                 7, _EXP_G_INFO, True),
+        ("target_price",   "قیمت ناحیه",         11, _EXP_G_INFO, True),
+        ("fired_price",    "قیمت فایر",          11, _EXP_G_INFO, True),
+        ("status",         "وضعیت",              12, _EXP_G_INFO, True),
+        ("created_by",     "ثبت‌کننده",          12, _EXP_G_INFO, True),
+        ("comment",        "کامنت ثبت‌کننده",    32, _EXP_G_INFO, True),
+        ("supporters_names", "ستاره‌دهنده‌ها (تأیید ناحیه)", 20, _EXP_G_INFO, True),
+        ("supporters_count", "تعداد ستاره",       9, _EXP_G_INFO, True),
+        ("is_private",     "خصوصی",               7, _EXP_G_INFO, True),
+
+        ("created_date",   "تاریخ ثبت",          11, _EXP_G_TIME, True),
+        ("created_time",   "ساعت ثبت",            9, _EXP_G_TIME, True),
+        ("fired_date",     "تاریخ فایر",         11, _EXP_G_TIME, True),
+        ("fired_time",     "ساعت فایر",           9, _EXP_G_TIME, True),
+        ("duration_hours", "مدت تا فایر (ساعت)", 12, _EXP_G_TIME, True),
+        ("expired_date",   "تاریخ انقضا",        11, _EXP_G_TIME, False),
+        ("expired_time",   "ساعت انقضا",          9, _EXP_G_TIME, False),
+
+        ("score_total",    "جمع امتیاز نهایی",   12, _EXP_G_RATE, True),
+        ("setup_type",     "نوع ستاپ",           20, _EXP_G_RATE, True),
+        ("voters_count",   "تعداد رأی‌دهنده",    10, _EXP_G_RATE, True),
+        ("rating_status",  "وضعیت رأی‌گیری",     12, _EXP_G_RATE, True),
+        ("votes_text",     "نظر و امتیاز اعضا (یکجا)", 48, _EXP_G_RATE, True),
+    ]
+    for m in TEAM_MEMBERS:
+        cols.append((f"score_{m}", f"امتیاز {m}", 9, _EXP_G_MEMB, True))
+    for m in TEAM_MEMBERS:
+        cols.append((f"cmt_{m}", f"کامنت {m}", 28, _EXP_G_MEMB, False))
+    cols += [
+        ("false_reason",   "علت False",          22, _EXP_G_FALSE, True),
+        ("false_date",     "تاریخ False",        11, _EXP_G_FALSE, True),
+        ("false_time",     "ساعت False",          9, _EXP_G_FALSE, True),
+
+        ("bot_text",       "متن کامل پیام ربات", 70, _EXP_G_BOT, True),
+
+        ("manual_reaction", "واکنش قیمت (دستی)", 20, _EXP_G_MAN, True),
+        ("manual_result",   "نتیجه / R (دستی)",  16, _EXP_G_MAN, True),
+        ("manual_note",     "یادداشت (دستی)",    26, _EXP_G_MAN, True),
+    ]
+    return cols
+
+def _exp_get_all(path, params, page=1000):
+    """GET صفحه‌به‌صفحه از Supabase (سقف ۱۰۰۰ ردیف در هر درخواست). اگه خطا بده Exception می‌ده —
+    دیگه بی‌صدا خروجی خالی نمی‌ده."""
+    params = list(params)
+    if not any(k == "order" for k, _ in params):
+        params.append(("order", "id.asc"))
+    out, off = [], 0
+    while True:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}",
+                         params=params + [("limit", str(page)), ("offset", str(off))],
+                         headers=_sb_h(), timeout=25)
+        if r.status_code != 200:
+            raise RuntimeError(f"{path}: HTTP {r.status_code} — {r.text[:200]}")
+        batch = r.json() or []
+        out.extend(batch)
+        if len(batch) < page:
+            break
+        off += page
+    return out
+
+def _exp_in_list(values):
+    """in.("a","b") با کوتیشن، تا اسم فارسی/فاصله/کاما مشکل نسازه"""
+    return "in.(" + ",".join('"' + str(v).replace('"', '') + '"' for v in values) + ")"
+
 @app.route("/report/export")
 def report_export_html():
-    """صفحه‌ی دانلود دیتا — بازه‌ی تاریخ + فیلترهای ترکیبی + دکمه‌ی خروجی اکسل"""
-    assignee_rows = "".join(
-        f'<label class="chk-row"><input type="checkbox" value="{m}" class="assigneeChk"> {m}</label>'
-        for m in TEAM_MEMBERS
-    )
+    """صفحه‌ی دانلود دیتا — بازه‌ی تاریخ + فیلترها + انتخاب ستون‌ها + دکمه‌ی خروجی اکسل"""
     today_str = datetime.now(TEHRAN).strftime("%Y-%m-%d")
     month_ago_str = (datetime.now(TEHRAN) - timedelta(days=30)).strftime("%Y-%m-%d")
     default_from = request.args.get("from", "") or month_ago_str
     default_to = request.args.get("to", "") or today_str
+    col_rows, cur_grp = "", None
+    for key, label, _w, grp, dflt in _export_column_defs():
+        if grp != cur_grp:
+            col_rows += f'<div class="col-grp">{grp}</div>'
+            cur_grp = grp
+        col_rows += (f'<label><input type="checkbox" class="colChk" value="{key}"'
+                     f'{" checked" if dflt else ""}> {label}</label>')
     html = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -7860,6 +7945,9 @@ def report_export_html():
   .col-list label{{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:400;
     color:var(--text);margin:0;padding:6px 0}}
   .col-list input{{width:16px;height:16px}}
+  .col-grp{{font-size:11px;font-weight:800;color:var(--blue);margin:10px 0 2px;padding-top:8px;
+    border-top:1px solid var(--border2)}}
+  .col-grp:first-child{{border-top:none;margin-top:0;padding-top:0}}
   .modal-btns{{display:flex;gap:8px}}
   .modal-btns button{{flex:1;padding:11px;border-radius:10px;border:none;font-size:13px;font-weight:700;
     cursor:pointer;font-family:inherit}}
@@ -7879,19 +7967,14 @@ def report_export_html():
   </div>
 
   <div class="fld">
-    <label>وضعیت (خالی = همه)</label>
+    <label>وضعیت (خالی = فایرشده + False شده + منقضی‌شده)</label>
     <div class="chk-group">
       <label class="chk-row"><input type="checkbox" value="fired" class="statusChk"> ✅ فایرشده</label>
       <label class="chk-row"><input type="checkbox" value="false" class="statusChk"> ❌ False شده</label>
       <label class="chk-row"><input type="checkbox" value="expired" class="statusChk"> ⌛ منقضی‌شده</label>
-      <label class="chk-row"><input type="checkbox" value="active" class="statusChk"> 🟢 فعال</label>
+      <label class="chk-row"><input type="checkbox" value="active" class="statusChk"> 🟢 فعال (هنوز فایر نشده)</label>
       <label class="chk-row"><input type="checkbox" value="instant" class="statusChk"> ⚡ فوری</label>
     </div>
-  </div>
-
-  <div class="fld">
-    <label>مسئول (خالی = همه)</label>
-    <div class="chk-group">{assignee_rows}</div>
   </div>
 
   <div class="row2">
@@ -7906,38 +7989,20 @@ def report_export_html():
   </div>
 
   <button class="dl-btn" id="dlBtn" onclick="openColumnModal()">📥 دانلود اکسل</button>
-  <div class="hint">بازه‌ی تاریخ بر اساس تاریخ فایر شدن آلارم اعمال می‌شه. فیلترها با هم AND می‌شن.<br>
-  ⓘ آلارم‌های فایرشده‌ی قبل از ۱۱ ژوئن ۲۰۲۶ («فایرشده (قدیمی)» تو ستون وضعیت) مربوط به قبل از راه‌اندازی سیستم «مسئول آلارم» هستن — برای این‌ها ستون‌های «مسئول» و «علت/تاریخ False» همیشه خالیه، چون اون‌موقع اصلاً همچین چیزی ثبت نمی‌شد. اگه فیلتر «مسئول» رو فعال کنید، این آلارم‌های قدیمی (چون مسئول ندارن) تو خروجی نمیان.</div>
+  <div class="hint">بازه‌ی تاریخ برای فایرشده/False/فوری بر اساس تاریخ فایر، برای منقضی‌شده بر اساس تاریخ انقضا و برای «فعال» بر اساس تاریخ ثبت اعمال می‌شه. فیلترها با هم AND می‌شن.<br>
+  امتیاز، نوع ستاپ (A / B / پرریسک)، کامنت هر عضو، ستاره‌ها و متن کامل پیام ربات از سیستم جدید خونده می‌شن. ستون‌های «False (داده‌ی قدیمی)» فقط برای آلارم‌های قدیمی پر می‌شن.</div>
 </div>
 
 <div class="modal-overlay" id="columnModal">
   <div class="modal-box">
     <h2>ستون‌های اکسل</h2>
-    <div class="modal-sub">هر ستونی رو نمی‌خواید تو خروجی باشه، تیکش رو بردارید.</div>
+    <div class="modal-sub">هر ستونی رو نمی‌خوای تو خروجی باشه، تیکش رو بردار.</div>
     <div class="col-actions">
       <button type="button" onclick="setAllColumns(true)">✅ انتخاب همه</button>
       <button type="button" onclick="setAllColumns(false)">❌ پاک کردن همه</button>
     </div>
     <div class="col-list">
-      <label><input type="checkbox" class="colChk" value="symbol" checked> نماد</label>
-      <label><input type="checkbox" class="colChk" value="alarm_tag" checked> هشتک</label>
-      <label><input type="checkbox" class="colChk" value="direction" checked> جهت</label>
-      <label><input type="checkbox" class="colChk" value="target_price" checked> قیمت هدف</label>
-      <label><input type="checkbox" class="colChk" value="fired_price" checked> قیمت فایر</label>
-      <label><input type="checkbox" class="colChk" value="status" checked> وضعیت</label>
-      <label><input type="checkbox" class="colChk" value="created_by" checked> ثبت‌کننده</label>
-      <label><input type="checkbox" class="colChk" value="assigned_to" checked> مسئول</label>
-      <label><input type="checkbox" class="colChk" value="created_date" checked> تاریخ ثبت</label>
-      <label><input type="checkbox" class="colChk" value="created_time" checked> ساعت ثبت</label>
-      <label><input type="checkbox" class="colChk" value="fired_date" checked> تاریخ فایر</label>
-      <label><input type="checkbox" class="colChk" value="fired_time" checked> ساعت فایر</label>
-      <label><input type="checkbox" class="colChk" value="false_reason" checked> علت False</label>
-      <label><input type="checkbox" class="colChk" value="false_date" checked> تاریخ False</label>
-      <label><input type="checkbox" class="colChk" value="false_time" checked> ساعت False</label>
-      <label><input type="checkbox" class="colChk" value="expired_date" checked> تاریخ انقضا</label>
-      <label><input type="checkbox" class="colChk" value="expired_time" checked> ساعت انقضا</label>
-      <label><input type="checkbox" class="colChk" value="is_private" checked> خصوصی</label>
-      <label><input type="checkbox" class="colChk" value="comment" checked> کامنت</label>
+      {col_rows}
     </div>
     <div class="modal-btns">
       <button class="btn-cancel" onclick="closeColumnModal()">انصراف</button>
@@ -7959,18 +8024,17 @@ function doExport() {{
   const from = document.getElementById('expFrom').value;
   const to = document.getElementById('expTo').value;
   const statuses = Array.from(document.querySelectorAll('.statusChk:checked')).map(c => c.value).join(',');
-  const assignees = Array.from(document.querySelectorAll('.assigneeChk:checked')).map(c => c.value).join(',');
   const creator = document.getElementById('expCreator').value.trim();
   const symbol = document.getElementById('expSymbol').value.trim();
   const columns = Array.from(document.querySelectorAll('.colChk:checked')).map(c => c.value).join(',');
+  if (!columns) {{ alert('حداقل یک ستون رو تیک بزن.'); return; }}
   const params = new URLSearchParams();
   if (from) params.set('from', from);
   if (to) params.set('to', to);
   if (statuses) params.set('statuses', statuses);
-  if (assignees) params.set('assignees', assignees);
   if (creator) params.set('creator', creator);
   if (symbol) params.set('symbol', symbol);
-  if (columns) params.set('columns', columns);
+  params.set('columns', columns);
   window.location.href = '/api/report/export.xlsx?' + params.toString();
   closeColumnModal();
 }}
@@ -7982,20 +8046,24 @@ function doExport() {{
 @app.route("/api/report/export.xlsx")
 def report_export_xlsx():
     """
-    خروجی اکسل واقعی (xlsx) — هدفمند و محدود به بازه/فیلتر انتخاب‌شده، نه کل جدول.
-    وضعیت «False شده» از جدول alarm_assignments (is_active=false) تشخیص داده می‌شه،
-    نه از خود alerts — چون False یه ویژگی از assignment هست، نه خود آلارم.
+    خروجی اکسل آلارم‌ها بر اساس سیستم جدید:
+    آلارم از جدول alerts + رأی‌ها از alarm_ratings + متن پیام ربات و وضعیت لغو از fired_msgs.
+    مسئول/تقسیم کنسل شده و دیگه نقشی نداره. هر خطای Supabase به‌جای فایل خالی، به‌صورت پیام خطا برمی‌گرده.
     """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
     except ImportError:
         return jsonify({"ok": False, "error": "پکیج openpyxl روی سرور نصب نیست — باید به requirements.txt اضافه بشه."}), 500
+    import io, html as html_lib
+
+    if not SUPABASE_KEY:
+        return jsonify({"ok": False, "error": "Supabase تنظیم نشده"}), 500
 
     from_str = request.args.get("from", "")
     to_str = request.args.get("to", "")
     statuses = [s.strip() for s in request.args.get("statuses", "").split(",") if s.strip()]
-    assignees = [a.strip() for a in request.args.get("assignees", "").split(",") if a.strip()]
     creators = [c.strip() for c in request.args.get("creator", "").split(",") if c.strip()]
     symbols = [s.strip().upper() for s in request.args.get("symbol", "").split(",") if s.strip()]
 
@@ -8003,272 +8071,308 @@ def report_export_xlsx():
     want_fired = want_all or "fired" in statuses
     want_false = want_all or "false" in statuses
     want_expired = want_all or "expired" in statuses
-    want_active = want_all or "active" in statuses
-    # آلارم فوری برخلاف بقیه، پیش‌فرض (want_all) جزوش نیست — فقط با تیک صریح میاد،
-    # چون از چرخه‌ی تخصیص/alarm_assignments رد نمی‌شه و می‌خوایم بشه مجزا دانلودش کرد.
-    want_instant = "instant" in statuses
+    want_active = "active" in statuses     # آلارم هنوز فایرنشده — فقط با تیک صریح
+    want_instant = "instant" in statuses   # فوری — فقط با تیک صریح
 
-    if not SUPABASE_KEY:
-        return jsonify({"ok": False, "error": "Supabase تنظیم نشده"}), 500
+    # تاریخ به‌صورت YYYY-MM-DD فیلتر می‌شه (هم برای ستون متنی و هم timestamp درست کار می‌کنه)
+    now_n = datetime.now(TEHRAN).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    def _parse_d(s, default):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d")
+        except Exception:
+            return default
+    gte = _parse_d(from_str, now_n - timedelta(days=30)).strftime("%Y-%m-%d")
+    lt = (_parse_d(to_str, now_n) + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    now_dt = datetime.now(TEHRAN)
+    flt = [("id", "neq.__config__")]
+    if creators:
+        flt.append(("created_by", _exp_in_list(creators)))
+    if symbols:
+        flt.append(("symbol", _exp_in_list(symbols)))
+
+    rows = {}
     try:
-        range_start = TEHRAN.localize(datetime.strptime(from_str, "%Y-%m-%d")) if from_str else (now_dt - timedelta(days=30))
-    except Exception:
-        range_start = now_dt - timedelta(days=30)
-    try:
-        range_end = TEHRAN.localize(datetime.strptime(to_str, "%Y-%m-%d")) + timedelta(days=1) if to_str else now_dt + timedelta(days=1)
-    except Exception:
-        range_end = now_dt + timedelta(days=1)
-    range_start_str = range_start.strftime("%Y-%m-%dT%H:%M:%S")
-    range_end_str = range_end.strftime("%Y-%m-%dT%H:%M:%S")
-
-    assignments_map = {}  # alert_id -> {assigned_to, is_active, false_by, false_at, false_reason, alarm_tag}
-
-    # جدول alarm_assignments (مسئول/False) از این تاریخ به بعد ساخته و پر شده — آلارم‌های
-    # فایرشده‌ی قدیمی‌تر از این، فقط تو خود alerts (status=fired) هستن و مسئول/False ندارن.
-    ASSIGN_SYSTEM_START = TEHRAN.localize(datetime(2026, 6, 11, 0, 0, 0))
-    assign_start_str = ASSIGN_SYSTEM_START.strftime("%Y-%m-%dT%H:%M:%S")
-
-    def _fetch_assignments(ids_list=None, assignee_list=None):
-        base_select = "select=id,assigned_to,is_active,false_by,false_at,false_reason,alarm_tag"
-        if ids_list:
-            # چون ممکنه لیست id خیلی طولانی باشه، تکه‌تکه (هر بار ۲۰۰ تا) می‌گیریم
-            out = []
-            ids_list = list(ids_list)
-            for i in range(0, len(ids_list), 200):
-                chunk = ids_list[i:i+200]
-                u = (f"{SUPABASE_URL}/rest/v1/alarm_assignments?{base_select}"
-                     f"&id=in.({','.join(chunk)})&limit={len(chunk)}")
-                r = requests.get(u, headers=_sb_h(), timeout=15)
-                if r.status_code == 200:
-                    out.extend(r.json())
-            return out
-        # حالت بازه‌ای: صفحه‌به‌صفحه همه‌ی رکوردهای این بازه رو می‌گیریم تا چیزی جا نمونه
-        out = []
-        page_size = 1000
-        offset = 0
-        while True:
-            u = (f"{SUPABASE_URL}/rest/v1/alarm_assignments?{base_select}"
-                 f"&fired_at=gte.{range_start_str}&fired_at=lt.{range_end_str}"
-                 f"&order=fired_at.asc&limit={page_size}&offset={offset}")
-            if assignee_list:
-                u += f"&assigned_to=in.({','.join(assignee_list)})"
-            r = requests.get(u, headers=_sb_h(), timeout=15)
-            if r.status_code != 200:
-                break
-            batch = r.json()
-            out.extend(batch)
-            if len(batch) < page_size:
-                break
-            offset += page_size
-        return out
-
-    try:
-        # دقیقا عین منطق گزارش هفتگی: همیشه از alarm_assignments بر اساس fired_at شروع می‌کنیم،
-        # بعد alertهای متناظرشون رو می‌گیریم. چه فیلتر مسئول زده باشه چه نه.
-        assign_rows = _fetch_assignments(assignee_list=assignees if assignees else None)
-        for x in assign_rows:
-            assignments_map[str(x.get("id",""))] = x
-        ids = sorted(assignments_map.keys())
-        if not ids:
-            rows = []
-        else:
-            rows = []
-            for i in range(0, len(ids), 200):
-                chunk = ids[i:i+200]
-                u2 = f"{SUPABASE_URL}/rest/v1/alerts?id=in.({','.join(chunk)})&select=*&limit={len(chunk)}"
-                if creators:
-                    u2 += f"&created_by=in.({','.join(creators)})"
-                if symbols:
-                    u2 += f"&symbol=in.({','.join(symbols)})"
-                r2 = requests.get(u2, headers=_sb_h(), timeout=15)
-                if r2.status_code == 200:
-                    rows.extend(r2.json())
-            rows = [x for x in rows if x.get("id") != "__config__"]
-
-        # منقضی‌شده‌ها هیچ‌وقت فایر نشدن، پس تو alarm_assignments نیستن — مستقیم از alerts
-        # بر اساس همون بازه‌ی expired_at میاریم. (چون آلارم منقضی‌شده مسئول نداره، فقط وقتی
-        # فیلتر مسئول زده نشده اضافه‌شون می‌کنیم.)
-        if want_expired and not assignees:
-            ue = (f"{SUPABASE_URL}/rest/v1/alerts"
-                  f"?expired_at=gte.{range_start_str}&expired_at=lt.{range_end_str}"
-                  f"&status=eq.expired&select=*&limit=5000")
-            if creators:
-                ue += f"&created_by=in.({','.join(creators)})"
-            if symbols:
-                ue += f"&symbol=in.({','.join(symbols)})"
-            re_exp = requests.get(ue, headers=_sb_h(), timeout=15)
-            expired_rows = re_exp.json() if re_exp.status_code == 200 else []
-            existing_ids = {str(x.get("id","")) for x in rows}
-            rows += [x for x in expired_rows if str(x.get("id","")) not in existing_ids]
-
-        # ── دیتای قدیمی (قبل از ساخته‌شدن alarm_assignments) — اون‌موقع هنوز مفهوم
-        # «مسئول»/False اصلاً نبود، پس این آلارم‌ها هیچ‌وقت تو alarm_assignments ثبت
-        # نمی‌شن. اگه بخشی از بازه‌ی انتخابی قبل از اون تاریخ باشه، مستقیم از خود
-        # alerts (status=fired) میاریمشون — بدون فیلتر مسئول (چون اصلاً معنی نداره). ──
-        if (want_fired or want_false or want_all) and not assignees and range_start < ASSIGN_SYSTEM_START:
-            legacy_end = min(range_end, ASSIGN_SYSTEM_START)
-            ul = (f"{SUPABASE_URL}/rest/v1/alerts"
-                  f"?fired_at=gte.{range_start_str}&fired_at=lt.{legacy_end.strftime('%Y-%m-%dT%H:%M:%S')}"
-                  f"&status=eq.fired&select=*&limit=5000")
-            if creators:
-                ul += f"&created_by=in.({','.join(creators)})"
-            if symbols:
-                ul += f"&symbol=in.({','.join(symbols)})"
-            r_legacy = requests.get(ul, headers=_sb_h(), timeout=15)
-            legacy_rows = r_legacy.json() if r_legacy.status_code == 200 else []
-            existing_ids = {str(x.get("id","")) for x in rows}
-            for x in legacy_rows:
-                if str(x.get("id","")) not in existing_ids:
-                    x["_legacy"] = True
-                    rows.append(x)
-
-        # آلارم فوری اصلاً وارد alarm_assignments نمیشه (چون تخصیص/رند-روبین نداره) —
-        # مستقیم از خود alerts با فیلتر instant=true میاریمش، فقط وقتی صریحاً خواسته شده.
+        def _add(batch):
+            for x in batch:
+                rows.setdefault(str(x.get("id", "")), x)
+        if want_fired or want_false:
+            _add(_exp_get_all("alerts", [("select", "*"), ("status", "eq.fired"),
+                                         ("fired_at", "gte." + gte), ("fired_at", "lt." + lt)] + flt))
+        if want_expired:
+            _add(_exp_get_all("alerts", [("select", "*"), ("status", "eq.expired"),
+                                         ("expired_at", "gte." + gte), ("expired_at", "lt." + lt)] + flt))
+        if want_active:
+            _add(_exp_get_all("alerts", [("select", "*"), ("status", "eq.active"),
+                                         ("created_at", "gte." + gte), ("created_at", "lt." + lt)] + flt))
         if want_instant:
-            ui = (f"{SUPABASE_URL}/rest/v1/alerts"
-                  f"?fired_at=gte.{range_start_str}&fired_at=lt.{range_end_str}"
-                  f"&instant=eq.true&select=*&limit=5000")
-            if creators:
-                ui += f"&created_by=in.({','.join(creators)})"
-            if symbols:
-                ui += f"&symbol=in.({','.join(symbols)})"
-            r_inst = requests.get(ui, headers=_sb_h(), timeout=15)
-            instant_rows = r_inst.json() if r_inst.status_code == 200 else []
-            existing_ids2 = {str(x.get("id","")) for x in rows}
-            for x in instant_rows:
-                if str(x.get("id","")) not in existing_ids2:
-                    x["_instant"] = True
-                    rows.append(x)
+            _add(_exp_get_all("alerts", [("select", "*"), ("instant", "eq.true"),
+                                         ("fired_at", "gte." + gte), ("fired_at", "lt." + lt)] + flt))
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": f"خطا در خوندن آلارم‌ها از Supabase: {e}"}), 500
 
-    # فیلتر نهایی — دقیقا مثل استت‌بار گزارش هفتگی (کل آلارم / فعال / False شده):
-    # «فایرشده» یعنی همه‌ی آلارم‌های فایرشده تو این بازه (چه فعال چه False)،
-    # «فعال» فقط زیرمجموعه‌ی فالس‌نشده، «False شده» فقط زیرمجموعه‌ی فالس‌شده.
-    final_rows = []
-    for a in rows:
-        st = a.get("status", "")
-        asg = assignments_map.get(str(a.get("id","")), {})
-        if a.get("_instant"):
-            # آلارم فوری — مسئول/تخصیص نداره، همیشه با همین برچسب مجزا
-            if want_instant:
-                final_rows.append((a, {}, "⚡ فوری"))
-        elif a.get("_legacy") and st == "fired":
-            # آلارم قدیمی از قبل سیستم مسئول — مفهوم مسئول/False براش وجود نداره
-            if want_fired or want_false or want_all:
-                final_rows.append((a, {}, "فایرشده (قدیمی)"))
-        elif st == "fired":
-            is_false = asg.get("is_active") is False
-            if is_false:
-                if want_fired or want_false:
-                    final_rows.append((a, asg, "False شده"))
-            else:
-                if want_fired or want_active:
-                    final_rows.append((a, asg, "فعال"))
-        elif st == "expired" and want_expired:
-            final_rows.append((a, asg, "منقضی‌شده"))
-
-    # مرتب‌سازی بر اساس تاریخ فایر (برای منقضی‌شده‌ها که فایر نشدن، بر اساس تاریخ انقضا)
-    final_rows.sort(key=lambda item: item[0].get("fired_at") or item[0].get("expired_at") or "")
+    ids = [i for i in rows.keys() if i]
+    votes_by, mm_by, asg_by = {}, {}, {}
+    try:
+        for i in range(0, len(ids), 100):
+            inl = "in.(" + ",".join(ids[i:i + 100]) + ")"
+            for v in _exp_get_all("alarm_ratings", [("select", "*"), ("alert_id", inl)]):
+                votes_by.setdefault(str(v.get("alert_id", "")), []).append(v)
+            for f in _exp_get_all("fired_msgs", [("select", "id,msg_map"), ("id", inl)]):
+                raw = f.get("msg_map") or {}
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except Exception:
+                        raw = {}
+                mm_by[str(f.get("id", ""))] = raw if isinstance(raw, dict) else {}
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"خطا در خوندن امتیازها/پیام‌ها از Supabase: {e}"}), 500
+    for vs in votes_by.values():
+        vs.sort(key=lambda v: str(v.get("voted_at") or ""))
+    # داده‌ی قدیمی False (قبل از کنسل شدن سیستم مسئول) — اختیاری؛ خطاش نباید خروجی رو خراب کنه
+    try:
+        for i in range(0, len(ids), 100):
+            inl = "in.(" + ",".join(ids[i:i + 100]) + ")"
+            for x in _exp_get_all("alarm_assignments",
+                                  [("select", "id,is_active,false_at,false_reason"), ("id", inl)]):
+                asg_by[str(x.get("id", ""))] = x
+    except Exception as e:
+        print(f"[export] alarm_assignments (قدیمی) خونده نشد، ادامه می‌دیم: {e}")
 
     def _split_dt(s):
-        """'2026-08-01 10:00:00' یا '2026-08-01T10:00:00' رو به (تاریخ, ساعت) جدا می‌کنه"""
-        s = (s or "").strip()
+        s = (s or "").strip().replace("T", " ")
         if not s:
             return "", ""
-        s = s.replace("T", " ")
-        parts = s.split(" ", 1)
-        if len(parts) == 2:
-            return parts[0], parts[1][:8]
-        return parts[0], ""
+        p = s.split(" ", 1)
+        return (p[0], p[1][:8]) if len(p) == 2 else (p[0], "")
 
-    # هر ستون یه کلید داره — پارامتر columns تو URL تعیین می‌کنه کدوما تو خروجی باشن
-    COLUMN_DEFS = [
-        ("symbol",       "نماد",         10),
-        ("alarm_tag",    "هشتک",         9),
-        ("direction",    "جهت",          6),
-        ("target_price", "قیمت هدف",     10),
-        ("fired_price",  "قیمت فایر",    10),
-        ("status",       "وضعیت",        11),
-        ("created_by",   "ثبت‌کننده",    12),
-        ("assigned_to",  "مسئول",        9),
-        ("created_date", "تاریخ ثبت",    11),
-        ("created_time", "ساعت ثبت",     9),
-        ("fired_date",   "تاریخ فایر",   11),
-        ("fired_time",   "ساعت فایر",    9),
-        ("false_reason", "علت False",    22),
-        ("false_date",   "تاریخ False",  11),
-        ("false_time",   "ساعت False",   9),
-        ("expired_date", "تاریخ انقضا",  11),
-        ("expired_time", "ساعت انقضا",   9),
-        ("is_private",   "خصوصی",        7),
-        ("comment",      "کامنت",        26),
-    ]
-    requested_cols = [c.strip() for c in request.args.get("columns", "").split(",") if c.strip()]
-    all_keys = [k for k, _, _ in COLUMN_DEFS]
-    selected_keys = [k for k in all_keys if (not requested_cols or k in requested_cols)]
-    label_by_key = {k: lbl for k, lbl, _ in COLUMN_DEFS}
-    width_by_key = {k: w for k, _, w in COLUMN_DEFS}
+    def _hours_between(a_s, b_s):
+        try:
+            fmt = "%Y-%m-%d %H:%M:%S"
+            a_d = datetime.strptime((a_s or "").replace("T", " ")[:19], fmt)
+            b_d = datetime.strptime((b_s or "").replace("T", " ")[:19], fmt)
+            return round((b_d - a_d).total_seconds() / 3600.0, 1)
+        except Exception:
+            return ""
+
+    _tier_fa = {"setup_a": "Setup A", "setup_b": "Setup B", "risky": "پرریسک", "no_votes": "بدون رأی"}
+
+    records = []
+    for aid, a in rows.items():
+        mm = mm_by.get(aid, {})
+        asg = asg_by.get(aid, {})
+        votes = votes_by.get(aid, [])
+        st = a.get("status", "")
+        cancelled = (mm.get("__rating_cancelled__") == "1") or (asg.get("is_active") is False)
+        is_instant = bool(a.get("instant"))
+
+        if is_instant:
+            if not want_instant:
+                continue
+            status_lbl = "⚡ فوری"
+        elif st == "fired":
+            if cancelled:
+                if not want_false:
+                    continue
+                status_lbl = "False شده"
+            else:
+                if not want_fired:
+                    continue
+                status_lbl = "فایرشده"
+        elif st == "expired":
+            if not want_expired:
+                continue
+            status_lbl = "منقضی‌شده"
+        elif st == "active":
+            if not want_active:
+                continue
+            status_lbl = "فعال (هنوز فایر نشده)"
+        else:
+            continue
+
+        # ── امتیاز و ستاپ ──
+        creator_res = _resolve_creator_name(mm.get("__creator__") or a.get("created_by", ""))
+        forced = mm.get("__rating_manual__") in ("1", "auto")
+        state = _compute_rating_state(votes, creator_res, force_closed=forced)
+        state_now = _compute_rating_state(votes, creator_res, force_closed=True)
+        had_rating = bool(votes) or bool(mm.get("__text_rated__")) or ("__creator__" in mm)
+        if cancelled:
+            setup_txt, rating_status = "لغو (False)", "لغو"
+        elif not had_rating:
+            setup_txt, rating_status = "رأی‌گیری نداشته", "—"
+        elif state["closed"]:
+            setup_txt, rating_status = _tier_fa.get(state["label"], state["label"]), "بسته"
+        else:
+            setup_txt = f"در حال رأی‌گیری (فعلاً {_tier_fa.get(state_now['label'], '')})"
+            rating_status = "باز"
+        score_total = state_now["total"] if votes else ""
+
+        by_member, lines = {}, []
+        for v in state_now["votes"]:
+            nm = (v.get("voter_name") or "").strip()
+            member = next((m for m in TEAM_MEMBERS if _norm_name(m) == _norm_name(nm)), None) \
+                or TEAM_ID_TO_NAME.get(str(v.get("voter_cid") or ""))
+            sc, why = v.get("score", ""), (v.get("reason") or "").strip()
+            if member:
+                by_member[member] = (sc, why)
+            lines.append(f"{nm or member or '—'}: {sc}/5" + (f" — {why}" if why else ""))
+
+        # ── ستاره‌ها ──
+        sup_names = []
+        for su in (a.get("supporters") or []):
+            if isinstance(su, dict) and su.get("name"):
+                sup_names.append(str(su["name"]))
+            elif isinstance(su, str) and su.strip():
+                sup_names.append(su.strip())
+
+        # ── متن کامل پیام ربات (بدون بخش امتیازدهی، بدون تگ HTML) ──
+        bot_txt = _strip_rating_section(mm.get("__text__") or mm.get("__text_rated__") or "")
+        bot_txt = html_lib.unescape(re.sub(r"<[^>]+>", "", bot_txt)).strip()
+
+        created_d, created_t = _split_dt(a.get("created_at", ""))
+        fired_d, fired_t = _split_dt(a.get("fired_at", ""))
+        expired_d, expired_t = _split_dt(a.get("expired_at", ""))
+        false_d, false_t = _split_dt(asg.get("false_at", ""))
+
+        vals = {
+            "alert_id": aid,
+            "symbol": a.get("symbol", ""),
+            "direction": "بای" if a.get("condition") == "below" else "سل",
+            "target_price": a.get("target_price", ""),
+            "fired_price": a.get("fired_price", "") or "",
+            "status": status_lbl,
+            "created_by": a.get("created_by", ""),
+            "comment": a.get("comment", "") or "",
+            "supporters_names": "، ".join(sup_names),
+            "supporters_count": len(sup_names) if sup_names else 0,
+            "is_private": "بله" if a.get("is_private") else "",
+            "created_date": created_d, "created_time": created_t,
+            "fired_date": fired_d, "fired_time": fired_t,
+            "duration_hours": _hours_between(a.get("created_at"), a.get("fired_at")) if a.get("fired_at") else "",
+            "expired_date": expired_d, "expired_time": expired_t,
+            "score_total": score_total, "setup_type": setup_txt,
+            "voters_count": state_now["voters_count"] if votes else 0,
+            "rating_status": rating_status,
+            "votes_text": "\n".join(lines),
+            "false_reason": asg.get("false_reason", "") or "",
+            "false_date": false_d, "false_time": false_t,
+            "bot_text": bot_txt[:30000],
+            "manual_reaction": "", "manual_result": "", "manual_note": "",
+        }
+        for m in TEAM_MEMBERS:
+            sc_why = by_member.get(m)
+            vals[f"score_{m}"] = sc_why[0] if sc_why else ""
+            vals[f"cmt_{m}"] = sc_why[1] if sc_why else ""
+        sort_key = a.get("fired_at") or a.get("expired_at") or a.get("created_at") or ""
+        records.append((str(sort_key).replace("T", " "), a, vals, setup_txt, score_total, status_lbl))
+
+    records.sort(key=lambda r: r[0])
+
+    # ── انتخاب ستون‌ها ──
+    col_defs = _export_column_defs()
+    requested = [c.strip() for c in request.args.get("columns", "").split(",") if c.strip()]
+    if requested:
+        selected = [d for d in col_defs if d[0] in requested]
+    else:
+        selected = [d for d in col_defs if d[4]]
+    if not selected:
+        selected = [d for d in col_defs if d[4]]
+    keys = [d[0] for d in selected]
+
+    _bad_ch = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    def _cell(v):
+        return _bad_ch.sub("", v) if isinstance(v, str) else v
 
     wb = Workbook()
     ws = wb.active
     ws.title = "آلارم‌ها"
     ws.sheet_view.rightToLeft = False
-    ws.append([label_by_key[k] for k in selected_keys])
-    header_fill = PatternFill("solid", fgColor="D9D9D9")
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-        cell.fill = header_fill
+    ws.append([d[1] for d in selected])
+    head_fill = PatternFill("solid", fgColor="D9D9D9")
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.fill = head_fill
+    ws.row_dimensions[1].height = 32
     ws.freeze_panes = "A2"
 
-    direction_col = selected_keys.index("direction") + 1 if "direction" in selected_keys else None
-    buy_fill   = PatternFill("solid", fgColor="D9F2E3")  # سبز کم‌رنگ
-    sell_fill  = PatternFill("solid", fgColor="FBDEDE")  # قرمز کم‌رنگ
-    zebra_fill = PatternFill("solid", fgColor="F5F5F5")  # رنگ آروم برای ردیف‌های یکی‌درمیان
+    buy_fill = PatternFill("solid", fgColor="D9F2E3")
+    sell_fill = PatternFill("solid", fgColor="FBDEDE")
+    zebra_fill = PatternFill("solid", fgColor="F5F5F5")
+    setup_fills = {"Setup A": PatternFill("solid", fgColor="BFE8CC"),
+                   "Setup B": PatternFill("solid", fgColor="CFE2FA"),
+                   "پرریسک": PatternFill("solid", fgColor="F8CFCF")}
+    dir_i = keys.index("direction") + 1 if "direction" in keys else None
+    setup_i = keys.index("setup_type") + 1 if "setup_type" in keys else None
+    score_i = keys.index("score_total") + 1 if "score_total" in keys else None
+    wrap_keys = {"comment", "votes_text", "bot_text", "supporters_names", "false_reason", "manual_note",
+                 "manual_reaction"} | {f"cmt_{m}" for m in TEAM_MEMBERS}
 
-    for a, asg, status_lbl in final_rows:
-        created_d, created_t = _split_dt(a.get("created_at",""))
-        fired_d, fired_t = _split_dt(a.get("fired_at",""))
-        false_d, false_t = _split_dt(asg.get("false_at",""))
-        expired_d, expired_t = _split_dt(a.get("expired_at",""))
-        direction_lbl = "بای" if a.get("condition") == "below" else "سل"
-        values_by_key = {
-            "symbol":       a.get("symbol",""),
-            "alarm_tag":    asg.get("alarm_tag","") or "",
-            "direction":    direction_lbl,
-            "target_price": a.get("target_price",""),
-            "fired_price":  a.get("fired_price","") or "",
-            "status":       status_lbl,
-            "created_by":   a.get("created_by",""),
-            "assigned_to":  asg.get("assigned_to","") or "",
-            "created_date": created_d, "created_time": created_t,
-            "fired_date":   fired_d,   "fired_time":   fired_t,
-            "false_reason": asg.get("false_reason","") or "",
-            "false_date":   false_d,   "false_time":   false_t,
-            "expired_date": expired_d, "expired_time": expired_t,
-            "is_private":   "بله" if a.get("is_private") else "",
-            "comment":      a.get("comment",""),
-        }
-        ws.append([values_by_key[k] for k in selected_keys])
+    for _sk, a, vals, setup_txt, score_total, status_lbl in records:
+        ws.append([_cell(vals[k]) for k in keys])
         r = ws.max_row
-        ws.row_dimensions[r].height = 24
-        # ردیف‌های یکی‌درمیون یه رنگ آروم بگیرن
+        for ci, k in enumerate(keys, start=1):
+            cell = ws.cell(row=r, column=ci)
+            cell.alignment = Alignment(vertical="top", wrap_text=(k in wrap_keys))
         if (r % 2) == 0:
             for cell in ws[r]:
                 cell.fill = zebra_fill
-        # فقط سلول جهت (بای/سل) رنگ خودشو بگیره
-        if direction_col:
-            dc = ws.cell(row=r, column=direction_col)
-            dc.fill = buy_fill if direction_lbl == "بای" else sell_fill
+        if dir_i:
+            ws.cell(row=r, column=dir_i).fill = buy_fill if vals["direction"] == "بای" else sell_fill
+        fill_setup = next((f for k2, f in setup_fills.items() if setup_txt.startswith(k2)), None)
+        if fill_setup:
+            if setup_i:
+                ws.cell(row=r, column=setup_i).fill = fill_setup
+            if score_i:
+                ws.cell(row=r, column=score_i).fill = fill_setup
 
-    from openpyxl.utils import get_column_letter
-    for i, k in enumerate(selected_keys, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = width_by_key[k]
+    for i, d in enumerate(selected, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = d[2]
+    if records:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(selected))}{ws.max_row}"
 
-    import io
+    # ── شیت خلاصه ──
+    ws2 = wb.create_sheet("خلاصه")
+    ws2.append(["بازه", f"{gte} تا {(_parse_d(to_str, now_n)).strftime('%Y-%m-%d')}"])
+    ws2.append(["تعداد کل ردیف‌ها", len(records)])
+    ws2.append([])
+    ws2.append(["وضعیت", "تعداد"])
+    cnt_status = {}
+    for _sk, a, vals, setup_txt, score_total, status_lbl in records:
+        cnt_status[status_lbl] = cnt_status.get(status_lbl, 0) + 1
+    for k2, n2 in cnt_status.items():
+        ws2.append([k2, n2])
+    ws2.append([])
+    ws2.append(["نوع ستاپ", "تعداد"])
+    cnt_setup = {}
+    for _sk, a, vals, setup_txt, score_total, status_lbl in records:
+        cnt_setup[setup_txt] = cnt_setup.get(setup_txt, 0) + 1
+    for k2, n2 in sorted(cnt_setup.items(), key=lambda x: -x[1]):
+        ws2.append([k2, n2])
+    ws2.append([])
+    ws2.append(["ثبت‌کننده", "تعداد", "میانگین امتیاز", "Setup A", "Setup B", "پرریسک"])
+    per_c = {}
+    for _sk, a, vals, setup_txt, score_total, status_lbl in records:
+        d2 = per_c.setdefault(a.get("created_by", "") or "—", {"n": 0, "sum": 0, "rated": 0, "A": 0, "B": 0, "R": 0})
+        d2["n"] += 1
+        if score_total != "":
+            d2["sum"] += score_total
+            d2["rated"] += 1
+        if setup_txt.startswith("Setup A"): d2["A"] += 1
+        elif setup_txt.startswith("Setup B"): d2["B"] += 1
+        elif setup_txt.startswith("پرریسک"): d2["R"] += 1
+    for nm2, d2 in sorted(per_c.items(), key=lambda x: -x[1]["n"]):
+        ws2.append([_cell(nm2), d2["n"], round(d2["sum"] / d2["rated"], 1) if d2["rated"] else "",
+                    d2["A"], d2["B"], d2["R"]])
+    ws2.column_dimensions["A"].width = 26
+    for col_l in "BCDEF":
+        ws2.column_dimensions[col_l].width = 14
+    for rr in ws2.iter_rows():
+        if rr and rr[0].value in ("وضعیت", "نوع ستاپ", "ثبت‌کننده"):
+            for c in rr:
+                c.font = Font(bold=True)
+                c.fill = head_fill
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
